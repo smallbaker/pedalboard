@@ -1654,6 +1654,13 @@ private:
       warnOnFailure(
           view->attached((void *)pluginHandle, defaultVST3WindowType));
       updatePluginScale();
+
+      // Let the window that hosts this editor know whether the plugin's view
+      // can be resized. JUCE never set this for VST3 editors, so a host
+      // asking isResizable() always got "no", even for a plugin that
+      // answers canResize() with "yes". Asked here, after attached(): some
+      // plugins do not know before.
+      setResizable(view->canResize() == kResultTrue, false);
     }
   }
 

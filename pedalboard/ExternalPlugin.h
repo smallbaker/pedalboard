@@ -135,7 +135,12 @@ Rendering MIDI via an external instrument plugin::
           )";
 
 static constexpr const char *SHOW_EDITOR_DOCSTRING = R"(
-Show the UI of this plugin as a native window.
+Show the UI of this plugin in a window with its own title bar.
+
+``title`` names the window (default: the plugin's name). ``powered`` sets the
+state of the power button in the title bar, and ``on_power`` is called with
+the new state (True = on, False = bypassed) whenever the button is clicked;
+it runs on the thread that called this method, from inside the event loop.
 
 This method may only be called on the main thread, and will block
 the main thread until any of the following things happens:
@@ -381,16 +386,96 @@ static std::vector<std::string> getPluginNamesForFile(std::string filename) {
   return pluginNames;
 }
 
+/**
+ * The look of our own window frame: a dark title bar with the title on the
+ * left (after the power button) and flat minimise/close glyphs on the right.
+ */
+class PluginWindowLookAndFeel : public juce::LookAndFeel_V4 {
+public:
+  static constexpr int POWER_BUTTON_SPACE = 34;
+
+  PluginWindowLookAndFeel()
+      : juce::LookAndFeel_V4(juce::LookAndFeel_V4::getDarkColourScheme()) {
+    setColour(juce::ResizableWindow::backgroundColourId,
+              juce::Colour(0xff1b1b1b));
+  }
+
+  void drawDocumentWindowTitleBar(juce::DocumentWindow &window,
+                                  juce::Graphics &g, int w, int h,
+                                  int titleSpaceX, int titleSpaceW,
+                                  const juce::Image *icon,
+                                  bool drawTitleTextOnLeft) override {
+    juce::ignoreUnused(icon, drawTitleTextOnLeft);
+    g.fillAll(juce::Colour(0xff242424));
+    g.setColour(juce::Colour(0xff3a3a3a));
+    g.fillRect(0, h - 1, w, 1);
+
+    const int textX = titleSpaceX + POWER_BUTTON_SPACE;
+    const int textW = std::max(0, titleSpaceW - POWER_BUTTON_SPACE);
+    g.setColour(window.isActiveWindow() ? juce::Colour(0xffe6e6e6)
+                                        : juce::Colour(0xff9a9a9a));
+    g.setFont(juce::Font((float)h * 0.55f, juce::Font::plain));
+    g.drawFittedText(window.getName(), textX, 0, textW, h,
+                     juce::Justification::centredLeft, 1);
+  }
+};
+
+/**
+ * The power button in the title bar: a ring with a stroke, amber when the
+ * plugin is on and grey when it is bypassed.
+ */
+class PluginPowerButton : public juce::Button {
+public:
+  PluginPowerButton() : juce::Button("power") {
+    setClickingTogglesState(true);
+    setTooltip("Bypass");
+  }
+
+  void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
+    const auto area = getLocalBounds().toFloat().reduced(2.0f);
+    const auto colour = getToggleState() ? juce::Colour(0xffe58a2f)
+                                         : juce::Colour(0xff7a7a7a);
+    g.setColour(highlighted || down ? colour.brighter(0.3f) : colour);
+    juce::Path ring;
+    const float radius = area.getWidth() / 2.0f;
+    ring.addCentredArc(area.getCentreX(), area.getCentreY(), radius, radius,
+                       0.0f, juce::MathConstants<float>::pi * 0.2f,
+                       juce::MathConstants<float>::pi * 1.8f, true);
+    g.strokePath(ring, juce::PathStrokeType(2.0f));
+    g.drawLine(area.getCentreX(), area.getY(), area.getCentreX(),
+               area.getCentreY(), 2.0f);
+  }
+};
+
 class StandalonePluginWindow : public juce::DocumentWindow {
 public:
-  StandalonePluginWindow(juce::AudioProcessor &processor)
-      : DocumentWindow("Pedalboard",
-                       juce::LookAndFeel::getDefaultLookAndFeel().findColour(
-                           juce::ResizableWindow::backgroundColourId),
+  static constexpr int TITLE_BAR_HEIGHT = 30;
+
+  StandalonePluginWindow(juce::AudioProcessor &processor,
+                         const juce::String &title, bool powered,
+                         std::function<void(bool)> onPower)
+      : DocumentWindow(title, juce::Colour(0xff1b1b1b),
                        juce::DocumentWindow::minimiseButton |
                            juce::DocumentWindow::closeButton),
-        processor(processor) {
-    setUsingNativeTitleBar(true);
+        processor(processor), onPower(std::move(onPower)) {
+    // Our own frame, drawn by JUCE, instead of the native one: the stand
+    // wants its title bar with a power button, as a DAW has.
+    setLookAndFeel(&lookAndFeel);
+    setUsingNativeTitleBar(false);
+    // JUCE paints the shadow of a non-native window with four extra
+    // top-level windows around it; a host that watches the windows of this
+    // process (or a screen reader) would see five windows instead of one.
+    setDropShadowEnabled(false);
+    setTitleBarHeight(TITLE_BAR_HEIGHT);
+    setTitleBarTextCentred(false);
+
+    powerButton.setToggleState(powered, juce::dontSendNotification);
+    powerButton.onClick = [this] {
+      if (this->onPower) {
+        this->onPower(powerButton.getToggleState());
+      }
+    };
+    addAndMakeVisible(powerButton);
 
     if (processor.hasEditor()) {
       if (auto *editor = processor.createEditorIfNeeded()) {
@@ -404,6 +489,19 @@ public:
     }
   }
 
+  void resized() override {
+    DocumentWindow::resized();
+    const auto bar = getTitleBarArea();
+    const int size = 18;
+    powerButton.setBounds(bar.getX() + 8, bar.getY() + (bar.getHeight() - size) / 2,
+                          size, size);
+    powerButton.toFront(false);
+  }
+
+  void setPowered(bool powered) {
+    powerButton.setToggleState(powered, juce::dontSendNotification);
+  }
+
   /**
    * Open a native window to show a given AudioProcessor's editor UI,
    * pumping the juce::MessageManager run loop as necessary to service
@@ -413,7 +511,9 @@ public:
    * window if necessary.
    */
   static void openWindowAndWait(juce::AudioProcessor &processor,
-                                py::object optionalEvent) {
+                                py::object optionalEvent,
+                                const juce::String &title, bool powered,
+                                std::function<void(bool)> onPower) {
     bool shouldThrowErrorAlreadySet = false;
 
     // Check the provided Event object before even opening the window:
@@ -427,7 +527,8 @@ public:
       // background while we the UI is running:
       py::gil_scoped_release release;
       JUCE_AUTORELEASEPOOL {
-        StandalonePluginWindow window(processor);
+        StandalonePluginWindow window(processor, title, powered,
+                                      std::move(onPower));
         window.show();
 
         // Run in a tight loop so that we don't have to call
@@ -469,16 +570,29 @@ public:
 
   void closeButtonPressed() override { setVisible(false); }
 
-  ~StandalonePluginWindow() override { clearContentComponent(); }
+  ~StandalonePluginWindow() override {
+    clearContentComponent();
+    setLookAndFeel(nullptr);
+  }
 
   void show() {
     setVisible(true);
     toFront(true);
     juce::Process::makeForegroundProcess();
+    // A VST3 view is only attached to a native window once we are visible,
+    // and some plugins do not know whether they can resize before that.
+    // Ask again now that they do.
+    if (auto *editor = dynamic_cast<juce::AudioProcessorEditor *>(
+            getContentComponent())) {
+      setResizable(editor->isResizable(), false);
+    }
   }
 
 private:
   juce::AudioProcessor &processor;
+  PluginWindowLookAndFeel lookAndFeel;
+  PluginPowerButton powerButton;
+  std::function<void(bool)> onPower;
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StandalonePluginWindow)
 };
@@ -1376,11 +1490,16 @@ public:
     return pluginInstance && pluginInstance->getMainBusNumInputChannels() > 0;
   }
 
-  void showEditor(py::object optionalEvent) {
+  void showEditor(py::object optionalEvent, std::optional<std::string> title,
+                  bool powered, py::object onPower) {
     if (!pluginInstance) {
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
           "Pedalboard error and should be reported.");
+    }
+
+    if (onPower != py::none() && !py::hasattr(onPower, "__call__")) {
+      throw py::type_error("on_power must be callable or None.");
     }
 
     if (optionalEvent != py::none() && !py::hasattr(optionalEvent, "is_set")) {
@@ -1404,7 +1523,34 @@ public:
       }
     }
 
-    StandalonePluginWindow::openWindowAndWait(*pluginInstance, optionalEvent);
+    // The Python callable is kept in a member so that it is copied and
+    // released while we hold the GIL; the window only gets a plain function
+    // that acquires the GIL when the button is clicked.
+    editorPowerCallback = onPower;
+    std::function<void(bool)> callback;
+    if (onPower != py::none()) {
+      callback = [this](bool state) {
+        py::gil_scoped_acquire acquire;
+        try {
+          editorPowerCallback(state);
+        } catch (py::error_already_set &e) {
+          e.restore();
+          PyErr_Print();
+        }
+      };
+    }
+
+    const juce::String windowTitle =
+        title ? juce::String(*title)
+              : juce::String(pluginInstance->getName());
+    try {
+      StandalonePluginWindow::openWindowAndWait(
+          *pluginInstance, optionalEvent, windowTitle, powered, callback);
+    } catch (...) {
+      editorPowerCallback = py::none();
+      throw;
+    }
+    editorPowerCallback = py::none();
   }
 
   ExternalPluginReloadType reloadType = ExternalPluginReloadType::Unknown;
@@ -1460,6 +1606,8 @@ public:
   };
 
   PlayHead playHead;
+
+  py::object editorPowerCallback = py::none();
 
 private:
   std::unique_ptr<juce::AudioPluginInstance>
@@ -1890,7 +2038,9 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            py::return_value_policy::reference_internal)
       .def("show_editor",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::showEditor,
-           SHOW_EDITOR_DOCSTRING, py::arg("close_event") = py::none())
+           SHOW_EDITOR_DOCSTRING, py::arg("close_event") = py::none(),
+           py::arg("title") = py::none(), py::arg("powered") = true,
+           py::arg("on_power") = py::none())
       .def(
           "process",
           [](std::shared_ptr<Plugin> self, const py::array inputArray,
@@ -2157,7 +2307,9 @@ see :class:`pedalboard.VST3Plugin`.)
            py::return_value_policy::reference_internal)
       .def("show_editor",
            &ExternalPlugin<juce::AudioUnitPluginFormat>::showEditor,
-           SHOW_EDITOR_DOCSTRING, py::arg("close_event") = py::none())
+           SHOW_EDITOR_DOCSTRING, py::arg("close_event") = py::none(),
+           py::arg("title") = py::none(), py::arg("powered") = true,
+           py::arg("on_power") = py::none())
       .def(
           "process",
           [](std::shared_ptr<Plugin> self, const py::array inputArray,
