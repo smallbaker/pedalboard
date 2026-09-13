@@ -752,6 +752,9 @@ public:
   ~ExternalPlugin() {
     {
       std::lock_guard<std::mutex> lock(EXTERNAL_PLUGIN_MUTEX);
+      // The editor component inside the window belongs to the plugin
+      // instance: the window has to go first.
+      editorWindow.reset();
       if (pluginInstance) {
         pluginInstance->setPlayHead(nullptr);
       }
@@ -856,7 +859,8 @@ public:
 
       {
         std::lock_guard<std::mutex> lock(EXTERNAL_PLUGIN_MUTEX);
-        // Delete the plugin instance itself:
+        // Delete the plugin instance itself (and its editor window first):
+        editorWindow.reset();
         pluginInstance->setPlayHead(nullptr);
         pluginInstance.reset();
         NUM_ACTIVE_EXTERNAL_PLUGINS--;
@@ -1553,6 +1557,122 @@ public:
     editorPowerCallback = py::none();
   }
 
+  /**
+   * Open the editor window and return at once. The caller owns the event
+   * loop from then on: it has to call pumpEditors() regularly on this same
+   * (message) thread, or the window will not repaint or react.
+   */
+  void openEditor(std::optional<std::string> title, bool powered,
+                  py::object onPower) {
+    if (!pluginInstance) {
+      throw std::runtime_error(
+          "Editor cannot be shown - plugin not loaded. This is an internal "
+          "Pedalboard error and should be reported.");
+    }
+    if (onPower != py::none() && !py::hasattr(onPower, "__call__")) {
+      throw py::type_error("on_power must be callable or None.");
+    }
+    checkEditorThread();
+
+    if (editorWindow) {
+      if (editorWindow->isVisible()) {
+        py::gil_scoped_release release;
+        editorWindow->toFront(true);
+        return;
+      }
+      editorWindow.reset();
+    }
+
+    editorPowerCallback = onPower;
+    std::function<void(bool)> callback;
+    if (onPower != py::none()) {
+      callback = [this](bool state) {
+        py::gil_scoped_acquire acquire;
+        try {
+          editorPowerCallback(state);
+        } catch (py::error_already_set &e) {
+          e.restore();
+          PyErr_Print();
+        }
+      };
+    }
+    const juce::String windowTitle =
+        title ? juce::String(*title)
+              : juce::String(pluginInstance->getName());
+
+    py::gil_scoped_release release;
+    editorWindow = std::make_unique<StandalonePluginWindow>(
+        *pluginInstance, windowTitle, powered, callback);
+    editorWindow->show();
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
+  }
+
+  /** Close the editor window opened by openEditor(), if any. */
+  void closeEditor() {
+    checkEditorThread();
+    {
+      py::gil_scoped_release release;
+      if (editorWindow) {
+        editorWindow->setVisible(false);
+        editorWindow.reset();
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
+      }
+    }
+    editorPowerCallback = py::none();
+  }
+
+  /**
+   * Whether the window opened by openEditor() is still on screen. A window
+   * that the user closed is released here, on the message thread.
+   */
+  bool isEditorOpen() {
+    if (editorWindow && !editorWindow->isVisible()) {
+      closeEditor();
+    }
+    return editorWindow != nullptr;
+  }
+
+  /** The native handle (HWND on Windows) of the open editor window, or 0. */
+  std::uintptr_t editorHandle() {
+    if (!isEditorOpen()) {
+      return 0;
+    }
+    if (auto *peer = editorWindow->getPeer()) {
+      return (std::uintptr_t)peer->getNativeHandle();
+    }
+    return 0;
+  }
+
+  /** Reflect a bypass change made elsewhere on the window's power button. */
+  void setEditorPowered(bool powered) {
+    if (isEditorOpen()) {
+      py::gil_scoped_release release;
+      editorWindow->setPowered(powered);
+    }
+  }
+
+  /**
+   * Run the event loop for the windows opened by openEditor() for the given
+   * time. Call this from the message thread, between other work.
+   */
+  static void pumpEditors(int milliseconds) {
+    checkEditorThread();
+    py::gil_scoped_release release;
+    juce::MessageManager::getInstance()->runDispatchLoopUntil(milliseconds);
+  }
+
+  static void checkEditorThread() {
+    py::gil_scoped_release release;
+    if (!juce::Desktop::getInstance().getDisplays().getPrimaryDisplay()) {
+      throw std::runtime_error(
+          "Editor cannot be shown - no visual display devices available.");
+    }
+    if (!juce::MessageManager::getInstance()->isThisTheMessageThread()) {
+      throw std::runtime_error(
+          "Plugin UI windows can only be shown from the main thread.");
+    }
+  }
+
   ExternalPluginReloadType reloadType = ExternalPluginReloadType::Unknown;
   juce::PluginDescription foundPluginDescription;
 
@@ -1608,6 +1728,7 @@ public:
   PlayHead playHead;
 
   py::object editorPowerCallback = py::none();
+  std::unique_ptr<StandalonePluginWindow> editorWindow;
 
 private:
   std::unique_ptr<juce::AudioPluginInstance>
@@ -2122,7 +2243,43 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
              double value) { plugin.playHead.bpm = value; },
           "The tempo, in beats per minute, that the plugin sees. Defaults to "
-          "120.");
+          "120.")
+      .def("open_editor",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::openEditor,
+           "Open the editor window and return at once. Unlike show_editor, "
+           "the window is then driven by the caller: call "
+           "VST3Plugin.pump_editors() regularly on this same thread, or the "
+           "window will neither repaint nor react. ``title``, ``powered`` and "
+           "``on_power`` are as for show_editor; ``on_power`` runs from inside "
+           "pump_editors(). Calling this while the window is open brings it "
+           "to the front.",
+           py::arg("title") = py::none(), py::arg("powered") = true,
+           py::arg("on_power") = py::none())
+      .def("close_editor",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::closeEditor,
+           "Close the window opened by open_editor(), if it is open.")
+      .def_property_readonly(
+          "editor_open",
+          &ExternalPlugin<juce::PatchedVST3PluginFormat>::isEditorOpen,
+          "Whether the window opened by open_editor() is still on screen. "
+          "Becomes False once the user closes it.")
+      .def_property_readonly(
+          "editor_handle",
+          &ExternalPlugin<juce::PatchedVST3PluginFormat>::editorHandle,
+          "The native handle (HWND on Windows) of the window opened by "
+          "open_editor(), or 0 when there is none.")
+      .def("set_editor_powered",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::setEditorPowered,
+           "Set the state of the power button in the open editor window "
+           "without triggering on_power - for bypass changes made elsewhere.",
+           py::arg("powered"))
+      .def_static(
+          "pump_editors",
+          &ExternalPlugin<juce::PatchedVST3PluginFormat>::pumpEditors,
+          "Run the event loop of every window opened by open_editor() for "
+          "the given number of milliseconds. Must be called on the thread "
+          "that opened the windows.",
+          py::arg("milliseconds") = 10);
 #endif
 
 #if JUCE_PLUGINHOST_AU && JUCE_MAC
