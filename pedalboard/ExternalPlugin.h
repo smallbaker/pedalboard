@@ -521,13 +521,21 @@ public:
   ExternalPlugin(
       std::string &_pathToPluginFile,
       std::optional<std::string> pluginName = {},
-      float initializationTimeout = DEFAULT_INITIALIZATION_TIMEOUT_SECONDS)
+      float initializationTimeout = DEFAULT_INITIALIZATION_TIMEOUT_SECONDS,
+      std::optional<ExternalPluginReloadType> knownReloadType = {})
       : pathToPluginFile(_pathToPluginFile),
         initializationTimeout(initializationTimeout) {
     py::gil_scoped_release release;
     // Ensure we have a MessageManager, which is required by the VST wrapper
     // Without this, we get an assert(false) from JUCE at runtime
     juce::MessageManager::getInstance();
+
+    // When the caller already knows how this plugin behaves on reset, skip
+    // the probe: detectReloadType() prepares and processes the plugin several
+    // times, which costs seconds on plugins with a slow prepareToPlay().
+    if (knownReloadType) {
+      reloadType = *knownReloadType;
+    }
 
     pluginFormatManager.addDefaultFormats();
     pluginFormatManager.addFormat(new juce::PatchedVST3PluginFormat());
@@ -630,6 +638,9 @@ public:
   ~ExternalPlugin() {
     {
       std::lock_guard<std::mutex> lock(EXTERNAL_PLUGIN_MUTEX);
+      if (pluginInstance) {
+        pluginInstance->setPlayHead(nullptr);
+      }
       pluginInstance.reset();
       NUM_ACTIVE_EXTERNAL_PLUGINS--;
 
@@ -732,6 +743,7 @@ public:
       {
         std::lock_guard<std::mutex> lock(EXTERNAL_PLUGIN_MUTEX);
         // Delete the plugin instance itself:
+        pluginInstance->setPlayHead(nullptr);
         pluginInstance.reset();
         NUM_ACTIVE_EXTERNAL_PLUGINS--;
       }
@@ -751,6 +763,7 @@ public:
                                      loadError.toStdString());
       }
 
+      pluginInstance->setPlayHead(&playHead);
       pluginInstance->enableAllBuses();
 
       auto mainInputBus = pluginInstance->getBus(true, 0);
@@ -778,6 +791,7 @@ public:
                                          pathToPluginFile.toStdString() + ": " +
                                          loadError.toStdString());
           }
+          pluginInstance->setPlayHead(&playHead);
         }
       }
 
@@ -1137,7 +1151,11 @@ public:
         setNumChannels(spec.numChannels);
       }
 
-      pluginInstance->setNonRealtime(true);
+      // Offline unless the caller asked for real time (see ``realtime``):
+      // plugins may pick different algorithms, and some refuse to behave like
+      // they do during DAW playback when told they are being rendered.
+      pluginInstance->setNonRealtime(!realtime);
+      playHead.sampleRate = spec.sampleRate;
       pluginInstance->prepareToPlay(spec.sampleRate, spec.maximumBlockSize);
 
       lastSpec = spec;
@@ -1186,8 +1204,15 @@ public:
             "number of channels passed in.)");
       }
 
+      // A plugin may keep more input buses enabled than we feed it: a
+      // sidechain it refuses to disable in setNumChannels(), for example.
+      // JUCE fills any channel that the buffer does not cover with a null
+      // pointer, and a plugin that reads its sidechain unconditionally then
+      // crashes. So size the buffer for every enabled input *and* output
+      // channel; the extra channels are silent dummies (see below).
       std::vector<float *> channelPointers(
-          pluginInstance->getTotalNumOutputChannels());
+          std::max(pluginInstance->getTotalNumInputChannels(),
+                   pluginInstance->getTotalNumOutputChannels()));
 
       for (size_t i = 0; i < outputBlock.getNumChannels(); i++) {
         channelPointers[i] = outputBlock.getChannelPointer(i);
@@ -1212,6 +1237,9 @@ public:
 
       pluginInstance->processBlock(audioBuffer, emptyMidiBuffer);
       samplesProvided += outputBlock.getNumSamples();
+      if (playHead.playing) {
+        playHead.positionSamples += (juce::int64)outputBlock.getNumSamples();
+      }
 
       // To compensate for any latency added by the plugin,
       // only tell Pedalboard to use the last _n_ samples.
@@ -1381,6 +1409,57 @@ public:
 
   ExternalPluginReloadType reloadType = ExternalPluginReloadType::Unknown;
   juce::PluginDescription foundPluginDescription;
+
+  /**
+   * Whether the plugin is told that it runs in real time, as during playback
+   * in a DAW, rather than being rendered offline. Off by default, which is
+   * what Pedalboard has always done.
+   */
+  bool realtime = false;
+
+  void setRealtime(bool value) {
+    if (realtime == value) {
+      return;
+    }
+    realtime = value;
+    // JUCE hands the mode to a VST3 plugin in setupProcessing(), i.e. from
+    // prepareToPlay(), and reuses it for every block after that. So the
+    // change only takes effect through a fresh prepare(): invalidate the
+    // last spec the same way reset() does.
+    lastSpec.maximumBlockSize = 0;
+  }
+
+  /**
+   * The transport that the plugin sees. Position advances by itself while
+   * ``playing`` is set; the host moves it on seeks and loop wraps.
+   */
+  class PlayHead : public juce::AudioPlayHead {
+  public:
+    bool getCurrentPosition(CurrentPositionInfo &info) override {
+      info.resetToDefault();
+      const double rate = sampleRate.load();
+      const juce::int64 samples = positionSamples.load();
+      const double tempo = bpm.load();
+      const double seconds = rate > 0 ? (double)samples / rate : 0.0;
+      const double beats = seconds * tempo / 60.0;
+      info.timeInSamples = samples;
+      info.timeInSeconds = seconds;
+      info.isPlaying = playing.load();
+      info.bpm = tempo;
+      info.timeSigNumerator = 4;
+      info.timeSigDenominator = 4;
+      info.ppqPosition = beats;
+      info.ppqPositionOfLastBarStart = std::floor(beats / 4.0) * 4.0;
+      return true;
+    }
+
+    std::atomic<juce::int64> positionSamples{0};
+    std::atomic<bool> playing{false};
+    std::atomic<double> bpm{120.0};
+    std::atomic<double> sampleRate{0.0};
+  };
+
+  PlayHead playHead;
 
 private:
   std::unique_ptr<juce::AudioPluginInstance>
@@ -1646,11 +1725,13 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
       .def(
           py::init([](std::string &pathToPluginFile, py::object parameterValues,
                       std::optional<std::string> pluginName,
-                      float initializationTimeout) {
+                      float initializationTimeout,
+                      std::optional<ExternalPluginReloadType> reloadType) {
             std::shared_ptr<ExternalPlugin<juce::PatchedVST3PluginFormat>>
                 plugin = std::make_shared<
                     ExternalPlugin<juce::PatchedVST3PluginFormat>>(
-                    pathToPluginFile, pluginName, initializationTimeout);
+                    pathToPluginFile, pluginName, initializationTimeout,
+                    reloadType);
             py::cast(plugin).attr("__set_initial_parameter_values__")(
                 parameterValues);
             return plugin;
@@ -1659,7 +1740,10 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           py::arg("parameter_values") = py::none(),
           py::arg("plugin_name") = py::none(),
           py::arg("initialization_timeout") =
-              DEFAULT_INITIALIZATION_TIMEOUT_SECONDS)
+              DEFAULT_INITIALIZATION_TIMEOUT_SECONDS,
+          // Pass the plugin's known reset behaviour (see ``_reload_type``) to
+          // skip the slow probe that would otherwise determine it.
+          py::arg("reload_type") = py::none())
       .def("__repr__",
            [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
              std::ostringstream ss;
@@ -1847,7 +1931,48 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           "The behavior that this plugin exhibits when .reset() is called. "
           "This is an internal attribute which gets set on plugin "
           "instantiation and should only be accessed for debugging and "
-          "testing.");
+          "testing.")
+      .def_property(
+          "realtime",
+          [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.realtime;
+          },
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
+             bool value) { plugin.setRealtime(value); },
+          "Whether the plugin is told that it runs in real time, as during "
+          "playback in a DAW, instead of being rendered offline. Defaults to "
+          "False. Some plugins choose different algorithms, or refuse to "
+          "behave like they do during playback, when rendering offline. "
+          "Changing this re-prepares the plugin before the next block, which "
+          "clears its internal state: set it before processing audio.")
+      .def_property(
+          "playhead_position",
+          [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.playHead.positionSamples.load();
+          },
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
+             juce::int64 value) { plugin.playHead.positionSamples = value; },
+          "The transport position, in samples, that the plugin sees. Advances "
+          "by itself with every processed block while ``playhead_playing`` is "
+          "True; set it on seeks and loop wraps.")
+      .def_property(
+          "playhead_playing",
+          [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.playHead.playing.load();
+          },
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
+             bool value) { plugin.playHead.playing = value; },
+          "Whether the transport that the plugin sees is running. Defaults to "
+          "False.")
+      .def_property(
+          "playhead_bpm",
+          [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.playHead.bpm.load();
+          },
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
+             double value) { plugin.playHead.bpm = value; },
+          "The tempo, in beats per minute, that the plugin sees. Defaults to "
+          "120.");
 #endif
 
 #if JUCE_PLUGINHOST_AU && JUCE_MAC
