@@ -629,6 +629,42 @@ public:
   AbstractExternalPlugin() : Plugin() {}
 };
 
+/**
+ * Make JUCE treat this process as DPI-aware, once, before it creates any
+ * window.
+ *
+ * On Windows JUCE only sets up DPI awareness - declaring the process
+ * per-monitor aware and loading the functions it needs to scale windows and
+ * to tell plugins their scale factor - when it believes it is a standalone
+ * application. Inside a Python process it believes it is not, so Windows
+ * renders every plugin window at 96 dpi and stretches the bitmap on a
+ * scaled display, and JUCE never applies the display's scale. JUCE decides
+ * "standalone" by whether an application factory is registered; register
+ * an empty one for the duration of the check and remove it again.
+ *
+ * This has to happen before the message manager exists: that creates the
+ * first (hidden) window of the process, and Windows will not change the
+ * DPI awareness of a process that already has windows.
+ */
+inline void ensureDPIAwareness() {
+#if JUCE_WINDOWS
+  static bool done = false;
+  if (done) {
+    return;
+  }
+  done = true;
+
+  auto *previous = juce::JUCEApplicationBase::createInstance;
+  if (previous == nullptr) {
+    juce::JUCEApplicationBase::createInstance =
+        []() -> juce::JUCEApplicationBase * { return nullptr; };
+  }
+  // Asking for the displays runs JUCE's DPI set-up.
+  juce::Desktop::getInstance().getDisplays();
+  juce::JUCEApplicationBase::createInstance = previous;
+#endif
+}
+
 template <typename ExternalPluginType>
 class ExternalPlugin : public AbstractExternalPlugin {
 public:
@@ -640,6 +676,9 @@ public:
       : pathToPluginFile(_pathToPluginFile),
         initializationTimeout(initializationTimeout) {
     py::gil_scoped_release release;
+    // Before the first window of the process, which the message manager
+    // creates: see ensureDPIAwareness().
+    ensureDPIAwareness();
     // Ensure we have a MessageManager, which is required by the VST wrapper
     // Without this, we get an assert(false) from JUCE at runtime
     juce::MessageManager::getInstance();
