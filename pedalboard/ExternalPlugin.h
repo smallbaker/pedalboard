@@ -1728,9 +1728,17 @@ public:
     }
     realtime = value;
     // JUCE hands the mode to a VST3 plugin in setupProcessing(), i.e. from
-    // prepareToPlay(), and reuses it for every block after that. So the
-    // change only takes effect through a fresh prepare(): invalidate the
-    // last spec the same way reset() does.
+    // prepareToPlay() - and skips prepareToPlay() altogether on an instance
+    // that is still active with the same sample rate and block size. So an
+    // active plugin is released here, the way a DAW deactivates plugins
+    // around an offline render, and the next prepare() runs prepareToPlay()
+    // in full with the new mode. Like reset(), this starts the plugin's
+    // internal state and its latency buffer over: switch before feeding
+    // audio, or feed a block of silence afterwards.
+    if (pluginInstance && lastSpec.maximumBlockSize != 0) {
+      pluginInstance->releaseResources();
+      samplesProvided = 0;
+    }
     lastSpec.maximumBlockSize = 0;
   }
 
@@ -2253,8 +2261,9 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           "playback in a DAW, instead of being rendered offline. Defaults to "
           "False. Some plugins choose different algorithms, or refuse to "
           "behave like they do during playback, when rendering offline. "
-          "Changing this re-prepares the plugin before the next block, which "
-          "clears its internal state: set it before processing audio.")
+          "Changing this deactivates and re-prepares the plugin before the "
+          "next block, as a DAW does around an offline render, which clears "
+          "its internal state: set it before processing audio.")
       .def_property(
           "playhead_position",
           [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
