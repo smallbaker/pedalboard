@@ -887,6 +887,7 @@ public:
     // later:
     juce::MemoryBlock savedState;
     std::map<int, float> currentParameters;
+    const bool replacingInstance = pluginInstance != nullptr;
 
     if (pluginInstance) {
       pluginInstance->getStateInformation(savedState);
@@ -970,14 +971,28 @@ public:
       }
     }
 
-    if (lastSpec.numChannels != 0) {
-      const juce::dsp::ProcessSpec _lastSpec = lastSpec;
-      // Invalidate lastSpec to force us to update the plugin state:
-      lastSpec.numChannels = 0;
-      prepare(_lastSpec);
+    // The new instance is not prepared yet. Prepare it the way the previous
+    // one was, if it was; otherwise the next block does, channel layout
+    // included.
+    const juce::dsp::ProcessSpec previousSpec = preparedSpec;
+    preparedSpec = {0};
+    if (previousSpec.maximumBlockSize != 0 && previousSpec.numChannels != 0) {
+      prepare(previousSpec);
+      // A plugin reloaded on reset with its saved state is switched off and
+      // on once after being prepared, as before: MagicDeathEyeStereo renders
+      // differently on every reset without it (measured). The instance
+      // stays active, so no further prepare follows.
+      if (replacingInstance) {
+        pluginInstance->reset();
+      }
     }
 
-    pluginInstance->reset();
+    // A freshly created instance is not reset: JUCE's reset() switches the
+    // component on without marking it active, so the next prepare() woke
+    // the plugin a second time - and a wake costs seconds on some plugins
+    // (AL-1: 0.9 s). Latency compensation starts over with the new
+    // instance, also after the reload-type probe.
+    samplesProvided = 0;
 
     // Try to warm up the plugin.
     // Some plugins (mostly instrument plugins) may load resources on start;
@@ -1266,12 +1281,23 @@ public:
     if (pluginInstance) {
       switch (reloadType) {
       case ExternalPluginReloadType::ClearsAudioOnReset:
-        pluginInstance->reset();
-        pluginInstance->releaseResources();
+        // Deactivate and prepare again right away with the same spec: the
+        // very cycle detectReloadType() classified this plugin with. One
+        // wake, and the plugin stays ready for the next block. (JUCE's own
+        // reset() switched the plugin off and on, and the releaseResources()
+        // after it made the next block wake the plugin a second time.)
+        if (preparedSpec.maximumBlockSize != 0) {
+          const juce::dsp::ProcessSpec spec = preparedSpec;
+          pluginInstance->releaseResources();
+          preparedSpec.maximumBlockSize = 0;
+          prepare(spec);
+        }
         break;
 
       case ExternalPluginReloadType::Unknown:
       case ExternalPluginReloadType::PersistsAudioOnReset:
+        // reinstantiatePlugin() prepares the new instance with the last
+        // spec when there was one.
         pluginInstance->releaseResources();
         reinstantiatePlugin();
         break;
@@ -1282,8 +1308,6 @@ public:
                                  "error or memory corruption.");
       }
 
-      // Force prepare() to be called again later by invalidating lastSpec:
-      lastSpec.maximumBlockSize = 0;
       samplesProvided = 0;
     }
   }
@@ -1297,13 +1321,16 @@ public:
       return;
     }
 
-    if (lastSpec.sampleRate != spec.sampleRate ||
-        lastSpec.maximumBlockSize < spec.maximumBlockSize ||
-        lastSpec.numChannels != spec.numChannels) {
+    // Decided by preparedSpec - what the instance is actually prepared
+    // with - and not by lastSpec: Python's reset() forgets lastSpec
+    // (resetLastChannelLayout) while the instance stays prepared, and going
+    // by it woke the plugin a second time after every reset.
+    lastSpec = spec;
+    if (!isPreparedFor(spec)) {
 
       // Changing the number of channels requires releaseResources to be
       // called:
-      if (lastSpec.numChannels != spec.numChannels) {
+      if (preparedSpec.numChannels != spec.numChannels) {
         pluginInstance->releaseResources();
         setNumChannels(spec.numChannels);
       }
@@ -1315,7 +1342,7 @@ public:
       playHead.sampleRate = spec.sampleRate;
       pluginInstance->prepareToPlay(spec.sampleRate, spec.maximumBlockSize);
 
-      lastSpec = spec;
+      preparedSpec = spec;
     }
   }
 
@@ -1722,6 +1749,13 @@ public:
    */
   bool realtime = false;
 
+  /**
+   * The spec the plugin instance is prepared with right now; all zeros when
+   * it is not prepared. Unlike lastSpec, it is not forgotten by Python's
+   * reset(), and it is what prepare() goes by.
+   */
+  juce::dsp::ProcessSpec preparedSpec = {0};
+
   void setRealtime(bool value) {
     if (realtime == value) {
       return;
@@ -1734,12 +1768,47 @@ public:
     // around an offline render, and the next prepare() runs prepareToPlay()
     // in full with the new mode. Like reset(), this starts the plugin's
     // internal state and its latency buffer over: switch before feeding
-    // audio, or feed a block of silence afterwards.
-    if (pluginInstance && lastSpec.maximumBlockSize != 0) {
+    // audio, or call prepare() afterwards.
+    if (pluginInstance && preparedSpec.maximumBlockSize != 0) {
       pluginInstance->releaseResources();
       samplesProvided = 0;
     }
-    lastSpec.maximumBlockSize = 0;
+    preparedSpec.maximumBlockSize = 0;
+  }
+
+  /**
+   * Wake the plugin now for blocks of up to maximumBlockSize samples at
+   * sampleRate with numChannels channels, without passing audio through it:
+   * what a DAW does when a plugin is inserted. The first block of that size
+   * then costs nothing extra. A plugin already prepared for a different
+   * configuration is deactivated first - the VST3 spec requires that before
+   * setupProcessing(), and JUCE's prepareToPlay() does not do it - and its
+   * latency compensation starts over.
+   */
+  void prepareForPlayback(double sampleRate, unsigned int maximumBlockSize,
+                          unsigned int numChannels) {
+    if (!pluginInstance) {
+      return;
+    }
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = static_cast<juce::uint32>(maximumBlockSize);
+    spec.numChannels = static_cast<juce::uint32>(numChannels);
+
+    if (!isPreparedFor(spec) && preparedSpec.maximumBlockSize != 0) {
+      pluginInstance->releaseResources();
+      samplesProvided = 0;
+      preparedSpec.maximumBlockSize = 0;
+    }
+    prepare(spec);
+  }
+
+  /** Whether the instance is prepared for blocks of this spec already. */
+  bool isPreparedFor(const juce::dsp::ProcessSpec &spec) const {
+    return preparedSpec.maximumBlockSize != 0 &&
+           preparedSpec.sampleRate == spec.sampleRate &&
+           preparedSpec.maximumBlockSize >= spec.maximumBlockSize &&
+           preparedSpec.numChannels == spec.numChannels;
   }
 
   /**
@@ -2250,6 +2319,24 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           "This is an internal attribute which gets set on plugin "
           "instantiation and should only be accessed for debugging and "
           "testing.")
+      .def(
+          "prepare",
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin,
+             double sampleRate, unsigned int bufferSize,
+             unsigned int numChannels) {
+            py::gil_scoped_release release;
+            std::scoped_lock lock(plugin.mutex);
+            plugin.prepareForPlayback(sampleRate, bufferSize, numChannels);
+          },
+          "Prepare the plugin for blocks of up to ``buffer_size`` samples at "
+          "``sample_rate`` with ``num_channels`` channels, without passing any "
+          "audio through it - what a DAW does when a plugin is inserted. Some "
+          "plugins take seconds to activate; after this call the first block "
+          "of that size costs nothing extra. A plugin already prepared for a "
+          "different configuration is deactivated first, and its latency "
+          "compensation starts over.",
+          py::arg("sample_rate"), py::arg("buffer_size") = DEFAULT_BUFFER_SIZE,
+          py::arg("num_channels") = 2)
       .def_property(
           "realtime",
           [](const ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
