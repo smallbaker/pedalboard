@@ -465,7 +465,7 @@ void revokeUIAMapEntriesForWindow(HWND) {}
 } // namespace juce
 #endif
 
-#include "../JUCE/modules/juce_gui_basics/native/juce_win32_Windowing.cpp"
+#include "juce_win32_PatchedWindowing.cpp"
 
 #include "../JUCE/modules/juce_gui_basics/native/juce_win32_DragAndDrop.cpp"
 

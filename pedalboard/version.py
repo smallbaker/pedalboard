@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-__version__ = "0.9.24.post3"
+__version__ = "0.9.24.post4"
 # Done this way so we can use dynamic-metadata to parse the version above.
 # The post-release suffix (".post1") is not part of MAJOR.MINOR.PATCH.
 MAJOR, MINOR, PATCH = (int(x) for x in __version__.split(".")[:3])

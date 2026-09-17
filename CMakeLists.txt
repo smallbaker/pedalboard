@@ -296,6 +296,8 @@ function(collect_sources)
     # We explicitly patch include_juce_gui_basics.{mm,cpp} with juce_patched_gui_basics.cpp,
     # so remove the latter from the list of C++ sources
     list(FILTER CPP_SOURCES EXCLUDE REGEX ".*juce_patched_gui_basics\\.cpp$")
+    # ...which includes our patched copy of the Windows windowing code itself
+    list(FILTER CPP_SOURCES EXCLUDE REGEX ".*juce_win32_PatchedWindowing\\.cpp$")
     
     # Collect RubberBand sources
     file(GLOB RUBBERBAND_SOURCES "vendors/rubberband/single/*.cpp")

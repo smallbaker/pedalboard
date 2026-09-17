@@ -17,6 +17,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cctype>
+#include <map>
 #include <mutex>
 #include <optional>
 
@@ -387,17 +390,102 @@ static std::vector<std::string> getPluginNamesForFile(std::string filename) {
 }
 
 /**
- * The look of our own window frame: a dark title bar with the title on the
- * left (after the power button) and flat minimise/close glyphs on the right.
+ * Colours of our window frame. The host passes the colours of its own theme
+ * to open_editor(); without them the frame takes the dark theme that the
+ * mstand stand starts with.
+ */
+struct PluginWindowColours {
+  /** The title bar and the frame around the editor. */
+  juce::Colour bar{0xff2b2d31};
+  /** The line between the title bar and the editor. */
+  juce::Colour line{0xff1d1e21};
+  /** The title of an active window. */
+  juce::Colour text{0xffdfe0e2};
+  /** Button glyphs, the title of an inactive window, a bypassed plugin. */
+  juce::Colour textDim{0xff93989f};
+  /** The one-pixel outline of the window. */
+  juce::Colour edge{0xff4a4e54};
+  /** The power button of a running plugin and the pin of a pinned window. */
+  juce::Colour accent{0xff7abaff};
+};
+
+/**
+ * Window colours from a dict of "#rrggbb" strings with the keys bar, line,
+ * text, text_dim, edge and accent. Keys left out keep their defaults, and
+ * None gives the defaults for all of them.
+ */
+inline PluginWindowColours parseWindowColours(py::object colors) {
+  PluginWindowColours colours;
+  if (colors.is_none()) {
+    return colours;
+  }
+  if (!py::isinstance<py::dict>(colors)) {
+    throw py::type_error(
+        "colors must be a dict of \"#rrggbb\" strings, or None.");
+  }
+  static const std::map<std::string, juce::Colour PluginWindowColours::*>
+      fields{{"bar", &PluginWindowColours::bar},
+             {"line", &PluginWindowColours::line},
+             {"text", &PluginWindowColours::text},
+             {"text_dim", &PluginWindowColours::textDim},
+             {"edge", &PluginWindowColours::edge},
+             {"accent", &PluginWindowColours::accent}};
+  for (auto item : colors.cast<py::dict>()) {
+    const auto key = py::str(item.first).cast<std::string>();
+    const auto field = fields.find(key);
+    if (field == fields.end()) {
+      throw py::key_error("Unknown window color: " + key);
+    }
+    const auto value = py::str(item.second).cast<std::string>();
+    const bool isHex =
+        value.size() == 7 && value[0] == '#' &&
+        std::all_of(value.begin() + 1, value.end(), [](char c) {
+          return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+        });
+    if (!isHex) {
+      throw py::value_error("Window color " + key +
+                            " must look like #rrggbb, got: " + value);
+    }
+    colours.*(field->second) = juce::Colour((juce::uint32)(
+        0xff000000u | std::stoul(value.substr(1), nullptr, 16)));
+  }
+  return colours;
+}
+
+/**
+ * The look of our own window frame: a slim title bar in the host's colours,
+ * with the power button and the title on the left and the pin and close
+ * buttons on the right, and a one-pixel outline around the window.
  */
 class PluginWindowLookAndFeel : public juce::LookAndFeel_V4 {
 public:
-  static constexpr int POWER_BUTTON_SPACE = 34;
+  static constexpr int TITLE_BAR_HEIGHT = 22;
+  static constexpr int BUTTON_WIDTH = 33;
+  static constexpr int GLYPH_SIZE = 8;
+  static constexpr int POWER_LEFT = 6;
+  static constexpr int POWER_SIZE = 14;
+  static constexpr int TITLE_GAP = 8;
+  /** In pixels, as the stand sets its own text: Segoe UI 9 pt at 96 dpi. */
+  static constexpr float TITLE_FONT_SIZE = 12.0f;
+
+  PluginWindowColours colours;
+  /** How many buttons stand at the right end of the title bar. */
+  int rightButtons = 2;
 
   PluginWindowLookAndFeel()
-      : juce::LookAndFeel_V4(juce::LookAndFeel_V4::getDarkColourScheme()) {
-    setColour(juce::ResizableWindow::backgroundColourId,
-              juce::Colour(0xff1b1b1b));
+      : juce::LookAndFeel_V4(juce::LookAndFeel_V4::getDarkColourScheme()) {}
+
+  /** Glyphs of an inactive window fade halfway into the title bar. */
+  juce::Colour glyphColour(bool activeWindow) const {
+    return activeWindow ? colours.textDim
+                        : colours.textDim.interpolatedWith(colours.bar, 0.5f);
+  }
+
+  /** The wash under a button in the mouse: light on a dark bar, dark on a light one. */
+  juce::Colour hoverColour() const {
+    return colours.bar.getPerceivedBrightness() < 0.5f
+               ? juce::Colours::white.withAlpha(0.1f)
+               : juce::Colours::black.withAlpha(0.08f);
   }
 
   void drawDocumentWindowTitleBar(juce::DocumentWindow &window,
@@ -405,68 +493,178 @@ public:
                                   int titleSpaceX, int titleSpaceW,
                                   const juce::Image *icon,
                                   bool drawTitleTextOnLeft) override {
-    juce::ignoreUnused(icon, drawTitleTextOnLeft);
-    g.fillAll(juce::Colour(0xff242424));
-    g.setColour(juce::Colour(0xff3a3a3a));
-    g.fillRect(0, h - 1, w, 1);
+    juce::ignoreUnused(titleSpaceX, titleSpaceW, icon, drawTitleTextOnLeft);
+    g.fillAll(colours.bar);
 
-    const int textX = titleSpaceX + POWER_BUTTON_SPACE;
-    const int textW = std::max(0, titleSpaceW - POWER_BUTTON_SPACE);
-    g.setColour(window.isActiveWindow() ? juce::Colour(0xffe6e6e6)
-                                        : juce::Colour(0xff9a9a9a));
-    g.setFont(juce::Font((float)h * 0.55f, juce::Font::plain));
-    g.drawFittedText(window.getName(), textX, 0, textW, h,
-                     juce::Justification::centredLeft, 1);
+    const int textX = POWER_LEFT + POWER_SIZE + TITLE_GAP;
+    const int textRight = w - rightButtons * BUTTON_WIDTH - TITLE_GAP;
+    g.setColour(window.isActiveWindow() ? colours.text : colours.textDim);
+    g.setFont(juce::Font("Segoe UI", TITLE_FONT_SIZE, juce::Font::plain)
+                  .withPointHeight(TITLE_FONT_SIZE));
+    g.drawText(window.getName(), textX, 0, std::max(0, textRight - textX), h,
+               juce::Justification::centredLeft, true);
+  }
+
+  void drawResizableWindowBorder(juce::Graphics &g, int w, int h,
+                                 const juce::BorderSize<int> &border,
+                                 juce::ResizableWindow &window) override {
+    juce::ignoreUnused(border, window);
+    g.setColour(colours.edge);
+    g.drawRect(0, 0, w, h, 1);
+  }
+
+  /** A resize border shows the same outline: JUCE would draw two translucent frames. */
+  void drawResizableFrame(juce::Graphics &g, int w, int h,
+                          const juce::BorderSize<int> &border) override {
+    juce::ignoreUnused(border);
+    g.setColour(colours.edge);
+    g.drawRect(0, 0, w, h, 1);
   }
 };
 
-/**
- * The power button in the title bar: a ring with a stroke, amber when the
- * plugin is on and grey when it is bypassed.
- */
-class PluginPowerButton : public juce::Button {
+/** A flat button of our title bar, drawn in the colours of the window. */
+class PluginTitleButton : public juce::Button {
 public:
-  PluginPowerButton() : juce::Button("power") {
+  PluginTitleButton(const juce::String &name, PluginWindowLookAndFeel &look)
+      : juce::Button(name), look(look) {
+    setWantsKeyboardFocus(false);
+  }
+
+protected:
+  bool windowIsActive() const {
+    auto *window = findParentComponentOfClass<juce::TopLevelWindow>();
+    return window == nullptr || window->isActiveWindow();
+  }
+
+  /** A square of GLYPH_SIZE pixels in the middle of the button. */
+  juce::Rectangle<float> glyphBox() const {
+    const auto size = (float)PluginWindowLookAndFeel::GLYPH_SIZE;
+    return juce::Rectangle<float>(size, size)
+        .withCentre(getLocalBounds().toFloat().getCentre());
+  }
+
+  PluginWindowLookAndFeel &look;
+};
+
+/**
+ * The power button: the power sign of the stand's rack, in the accent colour
+ * while the plugin runs and dim while it is bypassed.
+ */
+class PluginPowerButton : public PluginTitleButton {
+public:
+  explicit PluginPowerButton(PluginWindowLookAndFeel &look)
+      : PluginTitleButton("power", look) {
     setClickingTogglesState(true);
     setTooltip("Bypass");
   }
 
   void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
-    const auto area = getLocalBounds().toFloat().reduced(2.0f);
-    const auto colour = getToggleState() ? juce::Colour(0xffe58a2f)
-                                         : juce::Colour(0xff7a7a7a);
+    const auto colour =
+        getToggleState() ? look.colours.accent : look.colours.textDim;
     g.setColour(highlighted || down ? colour.brighter(0.3f) : colour);
-    juce::Path ring;
-    const float radius = area.getWidth() / 2.0f;
-    ring.addCentredArc(area.getCentreX(), area.getCentreY(), radius, radius,
-                       0.0f, juce::MathConstants<float>::pi * 0.2f,
-                       juce::MathConstants<float>::pi * 1.8f, true);
-    g.strokePath(ring, juce::PathStrokeType(2.0f));
-    g.drawLine(area.getCentreX(), area.getY(), area.getCentreX(),
-               area.getCentreY(), 2.0f);
+    // As the rack draws it: a ring of radius 5, open by 60 degrees at the
+    // top, and a stroke from above the ring to its middle - centred as a whole.
+    const auto centre = getLocalBounds().toFloat().getCentre();
+    const float ringY = centre.y + 0.75f;
+    juce::Path sign;
+    sign.addCentredArc(centre.x, ringY, 5.0f, 5.0f, 0.0f,
+                       juce::MathConstants<float>::pi / 6.0f,
+                       juce::MathConstants<float>::pi * 11.0f / 6.0f, true);
+    sign.startNewSubPath(centre.x, ringY - 6.5f);
+    sign.lineTo(centre.x, ringY - 0.5f);
+    g.strokePath(sign, juce::PathStrokeType(1.6f));
+  }
+};
+
+/**
+ * The pin. A window without it gives way to the next plugin window that
+ * opens, a pinned one stays: the Target button of Pro Tools the other way
+ * round. Upright in the accent colour when pinned, tilted when not.
+ */
+class PluginPinButton : public PluginTitleButton {
+public:
+  explicit PluginPinButton(PluginWindowLookAndFeel &look)
+      : PluginTitleButton("pin", look) {
+    setClickingTogglesState(true);
+    setTooltip("Pin: keep this window when another plugin opens");
+  }
+
+  void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
+    if (highlighted || down) {
+      g.fillAll(look.hoverColour());
+    }
+    // A push pin in a 12-unit square: the cap, the body widening into the
+    // collar, and the needle.
+    juce::Path pin;
+    pin.startNewSubPath(3.5f, 1.5f);
+    pin.lineTo(8.5f, 1.5f);
+    pin.startNewSubPath(4.5f, 1.5f);
+    pin.lineTo(4.5f, 5.5f);
+    pin.lineTo(3.0f, 7.5f);
+    pin.lineTo(9.0f, 7.5f);
+    pin.lineTo(7.5f, 5.5f);
+    pin.lineTo(7.5f, 1.5f);
+    pin.startNewSubPath(6.0f, 7.5f);
+    pin.lineTo(6.0f, 11.0f);
+    const auto tilt =
+        getToggleState()
+            ? juce::AffineTransform()
+            : juce::AffineTransform::rotation(
+                  juce::MathConstants<float>::pi / 4.0f, 6.0f, 6.0f);
+    const auto box = glyphBox();
+    pin.applyTransform(tilt.scaled(box.getWidth() / 12.0f)
+                           .translated(box.getX(), box.getY()));
+    g.setColour(getToggleState() ? look.colours.accent
+                                 : look.glyphColour(windowIsActive()));
+    g.strokePath(pin, juce::PathStrokeType(1.0f));
+  }
+};
+
+/** Close: a cross that turns white on red under the mouse, as in Windows. */
+class PluginCloseButton : public PluginTitleButton {
+public:
+  explicit PluginCloseButton(PluginWindowLookAndFeel &look)
+      : PluginTitleButton("close", look) {
+    setTooltip("Close");
+  }
+
+  void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
+    const bool hot = highlighted || down;
+    if (hot) {
+      g.fillAll(juce::Colour(0xffe81123));
+    }
+    const auto box = glyphBox();
+    g.setColour(hot ? juce::Colours::white
+                    : look.glyphColour(windowIsActive()));
+    g.drawLine(box.getX(), box.getY(), box.getRight(), box.getBottom(), 1.0f);
+    g.drawLine(box.getRight(), box.getY(), box.getX(), box.getBottom(), 1.0f);
   }
 };
 
 class StandalonePluginWindow : public juce::DocumentWindow {
 public:
-  static constexpr int TITLE_BAR_HEIGHT = 30;
-
   StandalonePluginWindow(juce::AudioProcessor &processor,
                          const juce::String &title, bool powered,
-                         std::function<void(bool)> onPower)
-      : DocumentWindow(title, juce::Colour(0xff1b1b1b),
-                       juce::DocumentWindow::minimiseButton |
-                           juce::DocumentWindow::closeButton),
-        processor(processor), onPower(std::move(onPower)) {
+                         std::function<void(bool)> onPower,
+                         std::function<void(bool)> onPin,
+                         const PluginWindowColours &colours, int resizeBorder)
+      : DocumentWindow(title, colours.bar, 0), processor(processor),
+        onPower(std::move(onPower)), onPin(std::move(onPin)),
+        resizeBorder(resizeBorder) {
     // Our own frame, drawn by JUCE, instead of the native one: the stand
-    // wants its title bar with a power button, as a DAW has.
+    // wants its title bar with a power button and a pin, as a DAW has. The
+    // buttons are ours as well, not those of DocumentWindow: there is no
+    // minimise button, and the pin sits next to close.
+    lookAndFeel.colours = colours;
+    // Without on_pin nobody would act on the pin, so there is no pin then.
+    lookAndFeel.rightButtons = this->onPin ? 2 : 1;
     setLookAndFeel(&lookAndFeel);
     setUsingNativeTitleBar(false);
     // JUCE paints the shadow of a non-native window with four extra
     // top-level windows around it; a host that watches the windows of this
     // process (or a screen reader) would see five windows instead of one.
     setDropShadowEnabled(false);
-    setTitleBarHeight(TITLE_BAR_HEIGHT);
+    setTitleBarHeight(PluginWindowLookAndFeel::TITLE_BAR_HEIGHT);
     setTitleBarTextCentred(false);
 
     powerButton.setToggleState(powered, juce::dontSendNotification);
@@ -476,6 +674,24 @@ public:
       }
     };
     addAndMakeVisible(powerButton);
+
+    pinButton.onClick = [this] {
+      if (this->onPin) {
+        this->onPin(pinButton.getToggleState());
+      }
+    };
+    addChildComponent(pinButton);
+    pinButton.setVisible((bool)this->onPin);
+
+    closeButton.onClick = [this] { closeButtonPressed(); };
+    addAndMakeVisible(closeButton);
+
+    // The border to resize by, when the host asks for one, lies around the
+    // editor and not over it: the editor is a native child window and takes
+    // the mouse itself. It sits in front of the content so that the mouse in
+    // the border reaches it and not the editor's own border component.
+    grip.setAlwaysOnTop(true);
+    addChildComponent(grip);
 
     if (processor.hasEditor()) {
       if (auto *editor = processor.createEditorIfNeeded()) {
@@ -489,17 +705,86 @@ public:
     }
   }
 
+  /**
+   * One pixel all round, resizable or not. JUCE would inset a resizable
+   * window by four, and at 125 % that is a five-pixel frame on three sides
+   * while the top merges with the title bar.
+   */
+  juce::BorderSize<int> getBorderThickness() override {
+    return juce::BorderSize<int>(isUsingNativeTitleBar() ? 0 : 1);
+  }
+
+  /** The editor sits inside the outline, the title bar and the resize border, if any. */
+  juce::BorderSize<int> getContentComponentBorder() override {
+    auto border = DocumentWindow::getContentComponentBorder();
+    if (hasGrip()) {
+      border.setLeft(border.getLeft() + resizeBorder);
+      border.setRight(border.getRight() + resizeBorder);
+      border.setBottom(border.getBottom() + resizeBorder);
+    }
+    return border;
+  }
+
+  /** Whether there is a resize border: asked for, and the plugin resizes at all. */
+  bool hasGrip() const { return resizeBorder > 0 && isResizable(); }
+
   void resized() override {
     DocumentWindow::resized();
+    // The border is draggable on the left, right and bottom; the top row is
+    // the outline only, so that the title bar keeps moving the window.
+    grip.setBorderThickness(juce::BorderSize<int>(1, 1 + resizeBorder,
+                                                  1 + resizeBorder,
+                                                  1 + resizeBorder));
+    grip.setBounds(getLocalBounds());
+    grip.setVisible(hasGrip());
+    using Look = PluginWindowLookAndFeel;
     const auto bar = getTitleBarArea();
-    const int size = 18;
-    powerButton.setBounds(bar.getX() + 8, bar.getY() + (bar.getHeight() - size) / 2,
-                          size, size);
+    powerButton.setBounds(bar.getX() + Look::POWER_LEFT,
+                          bar.getY() + (bar.getHeight() - Look::POWER_SIZE) / 2,
+                          Look::POWER_SIZE, Look::POWER_SIZE);
+    // The buttons stop short of the line under the title bar.
+    const int height = bar.getHeight() - 1;
+    closeButton.setBounds(bar.getRight() - Look::BUTTON_WIDTH, bar.getY(),
+                          Look::BUTTON_WIDTH, height);
+    pinButton.setBounds(closeButton.getX() - Look::BUTTON_WIDTH, bar.getY(),
+                        Look::BUTTON_WIDTH, height);
     powerButton.toFront(false);
+    pinButton.toFront(false);
+    closeButton.toFront(false);
+  }
+
+  void paint(juce::Graphics &g) override {
+    g.saveState();
+    DocumentWindow::paint(g);
+    g.restoreState();
+    // The line under the title bar runs through the frame on both sides: the
+    // frame of a resizable window is wider than its one-pixel outline, and
+    // the title bar does not cover it.
+    const auto bar = getTitleBarArea();
+    g.setColour(lookAndFeel.colours.line);
+    g.fillRect(1, bar.getBottom() - 1, getWidth() - 2, 1);
+  }
+
+  void activeWindowStatusChanged() override {
+    DocumentWindow::activeWindowStatusChanged();
+    // The glyphs fade with the window, and DocumentWindow repaints only the
+    // title bar buttons of its own.
+    pinButton.repaint();
+    closeButton.repaint();
   }
 
   void setPowered(bool powered) {
     powerButton.setToggleState(powered, juce::dontSendNotification);
+  }
+
+  void setPinned(bool pinned) {
+    pinButton.setToggleState(pinned, juce::dontSendNotification);
+  }
+
+  void setColours(const PluginWindowColours &colours) {
+    lookAndFeel.colours = colours;
+    setBackgroundColour(colours.bar);
+    repaint();
   }
 
   /**
@@ -528,7 +813,8 @@ public:
       py::gil_scoped_release release;
       JUCE_AUTORELEASEPOOL {
         StandalonePluginWindow window(processor, title, powered,
-                                      std::move(onPower));
+                                      std::move(onPower), {},
+                                      PluginWindowColours(), 0);
         window.show();
 
         // Run in a tight loop so that we don't have to call
@@ -590,9 +876,16 @@ public:
 
 private:
   juce::AudioProcessor &processor;
-  PluginWindowLookAndFeel lookAndFeel;
-  PluginPowerButton powerButton;
   std::function<void(bool)> onPower;
+  std::function<void(bool)> onPin;
+  /** Width of the border to resize by, in pixels; zero — none. */
+  int resizeBorder;
+  // The buttons draw with the look and feel, so it is constructed first.
+  PluginWindowLookAndFeel lookAndFeel;
+  PluginPowerButton powerButton{lookAndFeel};
+  PluginPinButton pinButton{lookAndFeel};
+  PluginCloseButton closeButton{lookAndFeel};
+  juce::ResizableBorderComponent grip{this, getConstrainer()};
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StandalonePluginWindow)
 };
@@ -1560,6 +1853,28 @@ public:
     return pluginInstance && pluginInstance->getMainBusNumInputChannels() > 0;
   }
 
+  /**
+   * A plain function for the editor window that calls the Python callable
+   * kept in `holder`. The callable lives in a member so that it is copied and
+   * released while we hold the GIL; the function acquires the GIL when a
+   * button is clicked, and prints an exception instead of letting it unwind
+   * through JUCE's event loop.
+   */
+  std::function<void(bool)> windowCallback(py::object &holder) {
+    if (holder.is_none()) {
+      return {};
+    }
+    return [&holder](bool state) {
+      py::gil_scoped_acquire acquire;
+      try {
+        holder(state);
+      } catch (py::error_already_set &e) {
+        e.restore();
+        PyErr_Print();
+      }
+    };
+  }
+
   void showEditor(py::object optionalEvent, std::optional<std::string> title,
                   bool powered, py::object onPower) {
     if (!pluginInstance) {
@@ -1593,22 +1908,8 @@ public:
       }
     }
 
-    // The Python callable is kept in a member so that it is copied and
-    // released while we hold the GIL; the window only gets a plain function
-    // that acquires the GIL when the button is clicked.
     editorPowerCallback = onPower;
-    std::function<void(bool)> callback;
-    if (onPower != py::none()) {
-      callback = [this](bool state) {
-        py::gil_scoped_acquire acquire;
-        try {
-          editorPowerCallback(state);
-        } catch (py::error_already_set &e) {
-          e.restore();
-          PyErr_Print();
-        }
-      };
-    }
+    const auto callback = windowCallback(editorPowerCallback);
 
     const juce::String windowTitle =
         title ? juce::String(*title)
@@ -1629,7 +1930,8 @@ public:
    * (message) thread, or the window will not repaint or react.
    */
   void openEditor(std::optional<std::string> title, bool powered,
-                  py::object onPower) {
+                  py::object onPower, py::object onPin, py::object colors,
+                  int resizeBorder) {
     if (!pluginInstance) {
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
@@ -1638,6 +1940,13 @@ public:
     if (onPower != py::none() && !py::hasattr(onPower, "__call__")) {
       throw py::type_error("on_power must be callable or None.");
     }
+    if (onPin != py::none() && !py::hasattr(onPin, "__call__")) {
+      throw py::type_error("on_pin must be callable or None.");
+    }
+    if (resizeBorder < 0) {
+      throw py::value_error("resize_border must be 0 or more.");
+    }
+    const PluginWindowColours colours = parseWindowColours(colors);
     checkEditorThread();
 
     if (editorWindow) {
@@ -1650,25 +1959,17 @@ public:
     }
 
     editorPowerCallback = onPower;
-    std::function<void(bool)> callback;
-    if (onPower != py::none()) {
-      callback = [this](bool state) {
-        py::gil_scoped_acquire acquire;
-        try {
-          editorPowerCallback(state);
-        } catch (py::error_already_set &e) {
-          e.restore();
-          PyErr_Print();
-        }
-      };
-    }
+    editorPinCallback = onPin;
+    auto powerCallback = windowCallback(editorPowerCallback);
+    auto pinCallback = windowCallback(editorPinCallback);
     const juce::String windowTitle =
         title ? juce::String(*title)
               : juce::String(pluginInstance->getName());
 
     py::gil_scoped_release release;
     editorWindow = std::make_unique<StandalonePluginWindow>(
-        *pluginInstance, windowTitle, powered, callback);
+        *pluginInstance, windowTitle, powered, std::move(powerCallback),
+        std::move(pinCallback), colours, resizeBorder);
     editorWindow->show();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
   }
@@ -1685,6 +1986,7 @@ public:
       }
     }
     editorPowerCallback = py::none();
+    editorPinCallback = py::none();
   }
 
   /**
@@ -1714,6 +2016,23 @@ public:
     if (isEditorOpen()) {
       py::gil_scoped_release release;
       editorWindow->setPowered(powered);
+    }
+  }
+
+  /** Set the pin of the open editor window from outside, without on_pin. */
+  void setEditorPinned(bool pinned) {
+    if (isEditorOpen()) {
+      py::gil_scoped_release release;
+      editorWindow->setPinned(pinned);
+    }
+  }
+
+  /** Repaint the frame of the open editor window in new colours. */
+  void setEditorColours(py::object colors) {
+    const PluginWindowColours colours = parseWindowColours(colors);
+    if (isEditorOpen()) {
+      py::gil_scoped_release release;
+      editorWindow->setColours(colours);
     }
   }
 
@@ -1844,6 +2163,7 @@ public:
   PlayHead playHead;
 
   py::object editorPowerCallback = py::none();
+  py::object editorPinCallback = py::none();
   std::unique_ptr<StandalonePluginWindow> editorWindow;
 
 private:
@@ -2385,11 +2705,20 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            "the window is then driven by the caller: call "
            "VST3Plugin.pump_editors() regularly on this same thread, or the "
            "window will neither repaint nor react. ``title``, ``powered`` and "
-           "``on_power`` are as for show_editor; ``on_power`` runs from inside "
-           "pump_editors(). Calling this while the window is open brings it "
-           "to the front.",
+           "``on_power`` are as for show_editor. With ``on_pin`` the title bar "
+           "also has a pin, which opens unpinned; ``on_pin`` is called with its "
+           "new state (True = pinned) on every click, and what a pin means is "
+           "up to the caller. Both callbacks run from inside pump_editors(). "
+           "``colors`` paints the frame: a dict of \"#rrggbb\" strings with "
+           "the keys bar, line, text, text_dim, edge and accent; keys left out "
+           "keep their defaults. ``resize_border`` puts a border of that many "
+           "pixels around the editor that resizes the window when dragged; 0, "
+           "the default, leaves the one-pixel outline, and the plugin resizes "
+           "by its own means. Calling this while the window is open brings it "
+           "to the front and changes nothing else.",
            py::arg("title") = py::none(), py::arg("powered") = true,
-           py::arg("on_power") = py::none())
+           py::arg("on_power") = py::none(), py::arg("on_pin") = py::none(),
+           py::arg("colors") = py::none(), py::arg("resize_border") = 0)
       .def("close_editor",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::closeEditor,
            "Close the window opened by open_editor(), if it is open.")
@@ -2408,6 +2737,15 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            "Set the state of the power button in the open editor window "
            "without triggering on_power - for bypass changes made elsewhere.",
            py::arg("powered"))
+      .def("set_editor_pinned",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::setEditorPinned,
+           "Set the pin in the open editor window without triggering on_pin.",
+           py::arg("pinned"))
+      .def("set_editor_colors",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::setEditorColours,
+           "Repaint the frame of the open editor window in new colors, given "
+           "as for open_editor().",
+           py::arg("colors"))
       .def_static(
           "pump_editors",
           &ExternalPlugin<juce::PatchedVST3PluginFormat>::pumpEditors,
