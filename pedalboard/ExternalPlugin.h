@@ -22,6 +22,8 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <tuple>
+#include <utility>
 
 #include "JuceHeader.h"
 #if JUCE_LINUX
@@ -647,7 +649,9 @@ public:
                          const juce::String &title, bool powered,
                          std::function<void(bool)> onPower,
                          std::function<void(bool)> onPin,
-                         const PluginWindowColours &colours, int resizeBorder)
+                         const PluginWindowColours &colours, int resizeBorder,
+                         std::optional<std::pair<int, int>> position = {},
+                         std::optional<std::tuple<int, int, int, int>> centreOn = {})
       : DocumentWindow(title, colours.bar, 0), processor(processor),
         onPower(std::move(onPower)), onPin(std::move(onPin)),
         resizeBorder(resizeBorder) {
@@ -686,12 +690,35 @@ public:
     closeButton.onClick = [this] { closeButtonPressed(); };
     addAndMakeVisible(closeButton);
 
-    // The border to resize by, when the host asks for one, lies around the
-    // editor and not over it: the editor is a native child window and takes
-    // the mouse itself. It sits in front of the content so that the mouse in
-    // the border reaches it and not the editor's own border component.
+    // The border the host asks for lies around every editor, and the window
+    // of a plugin that resizes is dragged by it. It lies around the editor and
+    // not over it: the editor is a native child window and takes the mouse
+    // itself. The grip sits in front of the content so that the mouse in the
+    // border reaches it and not the editor's own border component.
     grip.setAlwaysOnTop(true);
     addChildComponent(grip);
+
+    // Where the host wants the window: set before the plugin's view is
+    // attached (VST3PluginWindow::componentPeerChanged) and before the window
+    // is shown. JUCE creates a new window in the top-left corner of the main
+    // display. Shown there, the window jumped to its place in front of the
+    // user; attached there and then moved to a display with another scale,
+    // the view was resized by the scale change, and FabFilter Pro-Q 4
+    // remembered the smaller size. `position` is the window's top-left
+    // corner; `centreOn` is a rectangle to centre the window over, within the
+    // work area of that rectangle's display. Both are in physical pixels, the
+    // way the host measures windows; `position` wins when both are given.
+    const auto &displays = juce::Desktop::getInstance().getDisplays();
+    std::optional<juce::Rectangle<int>> centreArea;
+    if (position) {
+      setTopLeftPosition(displays.physicalToLogical(
+          juce::Point<int>(position->first, position->second)));
+    } else if (centreOn) {
+      const auto [x, y, width, height] = *centreOn;
+      centreArea = displays.physicalToLogical(
+          juce::Rectangle<int>(x, y, width, height));
+      setTopLeftPosition(centreArea->getPosition());
+    }
 
     if (processor.hasEditor()) {
       if (auto *editor = processor.createEditorIfNeeded()) {
@@ -702,6 +729,16 @@ public:
       }
     } else {
       throw std::runtime_error("Plugin has no available editor UI.");
+    }
+
+    // Centred once the view is attached: only then is its size known. The
+    // window is on that display already, so its scale does not change.
+    if (centreArea) {
+      auto bounds = getBounds().withCentre(centreArea->getCentre());
+      if (const auto *display = displays.getDisplayForRect(*centreArea)) {
+        bounds = bounds.constrainedWithin(display->userArea);
+      }
+      setTopLeftPosition(bounds.getPosition());
     }
   }
 
@@ -714,18 +751,20 @@ public:
     return juce::BorderSize<int>(isUsingNativeTitleBar() ? 0 : 1);
   }
 
-  /** The editor sits inside the outline, the title bar and the resize border, if any. */
+  /**
+   * The editor sits inside the outline, the title bar and the border. The
+   * border lies around every editor, resizable or not, so that all plugin
+   * windows look alike.
+   */
   juce::BorderSize<int> getContentComponentBorder() override {
     auto border = DocumentWindow::getContentComponentBorder();
-    if (hasGrip()) {
-      border.setLeft(border.getLeft() + resizeBorder);
-      border.setRight(border.getRight() + resizeBorder);
-      border.setBottom(border.getBottom() + resizeBorder);
-    }
+    border.setLeft(border.getLeft() + resizeBorder);
+    border.setRight(border.getRight() + resizeBorder);
+    border.setBottom(border.getBottom() + resizeBorder);
     return border;
   }
 
-  /** Whether there is a resize border: asked for, and the plugin resizes at all. */
+  /** Whether the window is dragged by its border: there is one, and the plugin resizes at all. */
   bool hasGrip() const { return resizeBorder > 0 && isResizable(); }
 
   void resized() override {
@@ -865,9 +904,9 @@ public:
     setVisible(true);
     toFront(true);
     juce::Process::makeForegroundProcess();
-    // A VST3 view is only attached to a native window once we are visible,
-    // and some plugins do not know whether they can resize before that.
-    // Ask again now that they do.
+    // Ask again now that the window is shown: a plugin knows whether it can
+    // resize only once its view is attached. Our VST3 wrapper attaches the
+    // view before the window is shown; other plugin formats may not.
     if (auto *editor = dynamic_cast<juce::AudioProcessorEditor *>(
             getContentComponent())) {
       setResizable(editor->isResizable(), false);
@@ -878,7 +917,7 @@ private:
   juce::AudioProcessor &processor;
   std::function<void(bool)> onPower;
   std::function<void(bool)> onPin;
-  /** Width of the border to resize by, in pixels; zero — none. */
+  /** Width of the border around the editor, in pixels; zero — none. */
   int resizeBorder;
   // The buttons draw with the look and feel, so it is constructed first.
   PluginWindowLookAndFeel lookAndFeel;
@@ -1931,7 +1970,9 @@ public:
    */
   void openEditor(std::optional<std::string> title, bool powered,
                   py::object onPower, py::object onPin, py::object colors,
-                  int resizeBorder) {
+                  int resizeBorder,
+                  std::optional<std::pair<int, int>> position,
+                  std::optional<std::tuple<int, int, int, int>> centreOn) {
     if (!pluginInstance) {
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
@@ -1969,7 +2010,7 @@ public:
     py::gil_scoped_release release;
     editorWindow = std::make_unique<StandalonePluginWindow>(
         *pluginInstance, windowTitle, powered, std::move(powerCallback),
-        std::move(pinCallback), colours, resizeBorder);
+        std::move(pinCallback), colours, resizeBorder, position, centreOn);
     editorWindow->show();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
   }
@@ -2712,13 +2753,21 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            "``colors`` paints the frame: a dict of \"#rrggbb\" strings with "
            "the keys bar, line, text, text_dim, edge and accent; keys left out "
            "keep their defaults. ``resize_border`` puts a border of that many "
-           "pixels around the editor that resizes the window when dragged; 0, "
-           "the default, leaves the one-pixel outline, and the plugin resizes "
-           "by its own means. Calling this while the window is open brings it "
-           "to the front and changes nothing else.",
+           "pixels around the editor of any plugin, and the window of a plugin "
+           "that resizes is resized by dragging it; 0, the default, leaves "
+           "only the one-pixel outline, and the plugin resizes by its own "
+           "means. ``position`` puts the window's top-left corner "
+           "at ``(x, y)`` before the window is shown, and ``center_on`` "
+           "centers it over the rectangle ``(x, y, width, height)`` within the "
+           "work area of that rectangle's display; both are in physical "
+           "pixels, and ``position`` wins when both are given. Without either "
+           "the window opens where JUCE puts a new window: in the top-left "
+           "corner of the main display. Calling this while the window is open "
+           "brings it to the front and changes nothing else.",
            py::arg("title") = py::none(), py::arg("powered") = true,
            py::arg("on_power") = py::none(), py::arg("on_pin") = py::none(),
-           py::arg("colors") = py::none(), py::arg("resize_border") = 0)
+           py::arg("colors") = py::none(), py::arg("resize_border") = 0,
+           py::arg("position") = py::none(), py::arg("center_on") = py::none())
       .def("close_editor",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::closeEditor,
            "Close the window opened by open_editor(), if it is open.")

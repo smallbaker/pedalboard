@@ -1511,6 +1511,16 @@ private:
     if (currentPeer != nullptr) {
       currentPeer->addScaleFactorListener(this);
       nativeScaleFactor = (float)currentPeer->getPlatformScaleFactor();
+
+      // Attach the plugin's view as soon as the editor sits in a native
+      // window, not only once that window is shown: then the view's size is
+      // known before the window is shown, and the host can place the window
+      // by it. Some plugins report their size only once attached (AMEK
+      // Mastering Compressor), and such a window was placed as if it were ten
+      // pixels square.
+      attachPluginWindow();
+      resizeToFit();
+      componentMovedOrResized(true, true);
     }
   }
 
