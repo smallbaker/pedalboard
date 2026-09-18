@@ -41,6 +41,15 @@
 #include <AudioToolbox/AudioUnitUtilities.h>
 #endif
 
+#if JUCE_WINDOWS
+namespace juce {
+// Defined in juce_overrides/juce_win32_PatchedWindowing.cpp, next to the
+// native window code they work on; used by StandalonePluginWindow.
+void setOwnerOfPeer(ComponentPeer &peer, void *owner);
+void setPeerPhysicalPosition(ComponentPeer &peer, Point<int> position);
+} // namespace juce
+#endif
+
 namespace Pedalboard {
 
 // JUCE external plugins use some global state; here we lock that state
@@ -651,10 +660,11 @@ public:
                          std::function<void(bool)> onPin,
                          const PluginWindowColours &colours, int resizeBorder,
                          std::optional<std::pair<int, int>> position = {},
-                         std::optional<std::tuple<int, int, int, int>> centreOn = {})
-      : DocumentWindow(title, colours.bar, 0), processor(processor),
+                         std::optional<std::tuple<int, int, int, int>> centreOn = {},
+                         void *owner = nullptr)
+      : DocumentWindow(title, colours.bar, 0, false), processor(processor),
         onPower(std::move(onPower)), onPin(std::move(onPin)),
-        resizeBorder(resizeBorder) {
+        resizeBorder(resizeBorder), owner(owner) {
     // Our own frame, drawn by JUCE, instead of the native one: the stand
     // wants its title bar with a power button and a pin, as a DAW has. The
     // buttons are ours as well, not those of DocumentWindow: there is no
@@ -698,13 +708,14 @@ public:
     grip.setAlwaysOnTop(true);
     addChildComponent(grip);
 
-    // Where the host wants the window: set before the plugin's view is
-    // attached (VST3PluginWindow::componentPeerChanged) and before the window
-    // is shown. JUCE creates a new window in the top-left corner of the main
-    // display. Shown there, the window jumped to its place in front of the
-    // user; attached there and then moved to a display with another scale,
-    // the view was resized by the scale change, and FabFilter Pro-Q 4
-    // remembered the smaller size. `position` is the window's top-left
+    // Where the host wants the window: set before the window is created, so
+    // that it is created there - before the plugin's view is attached
+    // (VST3PluginWindow::componentPeerChanged) and before the window is shown.
+    // Shown in the top-left corner of the main display, where JUCE puts a new
+    // window, the window jumped to its place in front of the user; attached
+    // there and then moved to a display with another scale, the view was
+    // resized by the scale change, and FabFilter Pro-Q 4 remembered the
+    // smaller size. `position` is the window's top-left
     // corner; `centreOn` is a rectangle to centre the window over, within the
     // work area of that rectangle's display. Both are in physical pixels, the
     // way the host measures windows; `position` wins when both are given.
@@ -720,16 +731,27 @@ public:
       setTopLeftPosition(centreArea->getPosition());
     }
 
-    if (processor.hasEditor()) {
-      if (auto *editor = processor.createEditorIfNeeded()) {
-        setContentOwned(editor, true);
-        setResizable(editor->isResizable(), false);
-      } else {
-        throw std::runtime_error("Failed to create plugin editor UI.");
-      }
-    } else {
+    // On the desktop only now, with every setting above made and at its
+    // place: DocumentWindow's constructor would create the window at once,
+    // and setDropShadowEnabled(false) would create it again. An owner, if
+    // any, owns the window before it is first shown.
+    addToDesktop();
+#if JUCE_WINDOWS
+    if (owner != nullptr) {
+      juce::setOwnerOfPeer(*getPeer(), owner);
+    }
+#endif
+
+    // Not hasEditor() first: while no editor is open, JUCE answers it for a
+    // VST3 plugin by creating the plugin's view and releasing it at once, so
+    // every window built the view twice. AL-1 builds its interface in
+    // createView, and its window took 0.73 s to show instead of 0.37 s.
+    auto *editor = processor.createEditorIfNeeded();
+    if (editor == nullptr) {
       throw std::runtime_error("Plugin has no available editor UI.");
     }
+    setContentOwned(editor, true);
+    setResizable(editor->isResizable(), false);
 
     // Centred once the view is attached: only then is its size known. The
     // window is on that display already, so its scale does not change.
@@ -740,6 +762,16 @@ public:
       }
       setTopLeftPosition(bounds.getPosition());
     }
+
+#if JUCE_WINDOWS
+    // Exactly where the host wants it, now that the window has its size.
+    // JUCE places windows in logical pixels, and at 125 % the window could
+    // land a pixel off; the host then moved it once it was shown.
+    if (position) {
+      juce::setPeerPhysicalPosition(
+          *getPeer(), juce::Point<int>(position->first, position->second));
+    }
+#endif
   }
 
   /**
@@ -749,6 +781,15 @@ public:
    */
   juce::BorderSize<int> getBorderThickness() override {
     return juce::BorderSize<int>(isUsingNativeTitleBar() ? 0 : 1);
+  }
+
+  /** An owned window has no taskbar button of its own: its owner's serves. */
+  int getDesktopWindowStyleFlags() const override {
+    auto flags = DocumentWindow::getDesktopWindowStyleFlags();
+    if (owner != nullptr) {
+      flags &= ~juce::ComponentPeer::windowAppearsOnTaskbar;
+    }
+    return flags;
   }
 
   /**
@@ -919,6 +960,8 @@ private:
   std::function<void(bool)> onPin;
   /** Width of the border around the editor, in pixels; zero — none. */
   int resizeBorder;
+  /** The native window that owns this one, or nullptr. */
+  void *owner;
   // The buttons draw with the look and feel, so it is constructed first.
   PluginWindowLookAndFeel lookAndFeel;
   PluginPowerButton powerButton{lookAndFeel};
@@ -1972,7 +2015,8 @@ public:
                   py::object onPower, py::object onPin, py::object colors,
                   int resizeBorder,
                   std::optional<std::pair<int, int>> position,
-                  std::optional<std::tuple<int, int, int, int>> centreOn) {
+                  std::optional<std::tuple<int, int, int, int>> centreOn,
+                  std::optional<std::uintptr_t> owner) {
     if (!pluginInstance) {
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
@@ -2010,7 +2054,8 @@ public:
     py::gil_scoped_release release;
     editorWindow = std::make_unique<StandalonePluginWindow>(
         *pluginInstance, windowTitle, powered, std::move(powerCallback),
-        std::move(pinCallback), colours, resizeBorder, position, centreOn);
+        std::move(pinCallback), colours, resizeBorder, position, centreOn,
+        owner ? reinterpret_cast<void *>(*owner) : nullptr);
     editorWindow->show();
     juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
   }
@@ -2762,12 +2807,16 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            "work area of that rectangle's display; both are in physical "
            "pixels, and ``position`` wins when both are given. Without either "
            "the window opens where JUCE puts a new window: in the top-left "
-           "corner of the main display. Calling this while the window is open "
-           "brings it to the front and changes nothing else.",
+           "corner of the main display. ``owner`` is the native handle of a "
+           "window that owns the editor window from before it is shown: the "
+           "editor window stays above it, hides with it and has no taskbar "
+           "button of its own. Calling this while the window is open brings "
+           "it to the front and changes nothing else.",
            py::arg("title") = py::none(), py::arg("powered") = true,
            py::arg("on_power") = py::none(), py::arg("on_pin") = py::none(),
            py::arg("colors") = py::none(), py::arg("resize_border") = 0,
-           py::arg("position") = py::none(), py::arg("center_on") = py::none())
+           py::arg("position") = py::none(), py::arg("center_on") = py::none(),
+           py::arg("owner") = py::none())
       .def("close_editor",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::closeEditor,
            "Close the window opened by open_editor(), if it is open.")

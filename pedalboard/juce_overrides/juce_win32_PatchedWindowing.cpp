@@ -4,10 +4,12 @@
    This file is part of the JUCE library.
    Copyright (c) 2020 - Raw Material Software Limited
 
-   Modified for pedalboard (mstand fork) on 2026-09-17: a copy of
-   modules/juce_gui_basics/native/juce_win32_Windowing.cpp from JUCE 6.1.4,
-   changed in getPlatformScaleFactor() only - an owned top-level window no
-   longer takes the scale factor of its owner (see the comment there).
+   Modified for pedalboard (mstand fork): a copy of
+   modules/juce_gui_basics/native/juce_win32_Windowing.cpp from JUCE 6.1.4.
+   2026-09-17: getPlatformScaleFactor() - an owned top-level window no longer
+   takes the scale factor of its owner (see the comment there).
+   2026-09-18: setOwnerOfPeer() and setPeerPhysicalPosition() added at the
+   end, for pedalboard's plugin window.
 
    JUCE is an open source library subject to commercial or open-source
    licensing.
@@ -5345,6 +5347,32 @@ private:
 
     std::unique_ptr<Impl> impl;
 };
+
+//==============================================================================
+// Added for pedalboard (mstand fork) on 2026-09-18: pedalboard's plugin window
+// (StandalonePluginWindow in ExternalPlugin.h) is set up with these before it
+// is first shown.
+
+/*  Makes `owner` the owner of the peer's top-level window. JUCE creates a
+    top-level window without an owner, and its parent argument would make a
+    child window instead. Windows keeps an owned window above its owner and
+    hides it with it.
+*/
+void setOwnerOfPeer (ComponentPeer& peer, void* owner)
+{
+    SetWindowLongPtr ((HWND) peer.getNativeHandle(), GWLP_HWNDPARENT, (LONG_PTR) owner);
+}
+
+/*  Puts the peer's window at a position given in physical pixels. JUCE places
+    windows in logical pixels, and at a scale such as 125 % not every physical
+    pixel has a logical one. The peer takes the new position as its own, as
+    when the user moves the window.
+*/
+void setPeerPhysicalPosition (ComponentPeer& peer, Point<int> position)
+{
+    SetWindowPos ((HWND) peer.getNativeHandle(), nullptr, position.x, position.y, 0, 0,
+                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
 
 //==============================================================================
 JUCE_END_IGNORE_WARNINGS_GCC_LIKE
