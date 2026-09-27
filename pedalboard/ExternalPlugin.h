@@ -936,6 +936,18 @@ public:
 
   void closeButtonPressed() override { setVisible(false); }
 
+  /**
+   * Not brought to the front before it is shown. TopLevelWindow's
+   * visibilityChanged() calls toFront(true) from inside setVisible(true),
+   * before the peer's ShowWindow, and for a window owned by another process's
+   * window that SetForegroundWindow waits for the owner's thread: 33 ms on
+   * every window of the mstand stand, with any plugin. show() brings the
+   * window to the front once it is visible, as a DAW does. The other half of
+   * the base, ResizableWindow remembering its last place for leaving
+   * full-screen mode, is not needed: these windows never go full screen.
+   */
+  void visibilityChanged() override {}
+
   ~StandalonePluginWindow() override {
     clearContentComponent();
     setLookAndFeel(nullptr);
