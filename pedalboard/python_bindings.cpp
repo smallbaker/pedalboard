@@ -132,7 +132,10 @@ or buffer, set ``reset`` to ``False``.
           },
           "Clear any internal state stored by this plugin (e.g.: reverb "
           "tails, delay lines, LFO state, etc). The values of plugin "
-          "parameters will remain unchanged. ")
+          "parameters will remain unchanged. An external (VST3/AU) plugin "
+          "that has processed no audio since its last reset or prepare() is "
+          "left alone: its state is fresh already, and waking it again "
+          "would only cost time.")
       .def(
           "process",
           [](std::shared_ptr<Plugin> self, const py::array inputArray,

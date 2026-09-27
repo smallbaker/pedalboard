@@ -2582,6 +2582,9 @@ public:
 
     processor->process(data);
 
+    lastOutputSilenceFlags =
+        outputBuses.isEmpty() ? 0 : outputBuses.getReference(0).silenceFlags;
+
     outputParameterChanges->forEach([&](Steinberg::int32 index, float value) {
       parameterDispatcher.push(index, value);
     });
@@ -2832,6 +2835,12 @@ public:
     return 0.0;
   }
 
+  /** mstand: the silence flags the plug-in set on its main output bus in its
+   * last process call. */
+  Steinberg::uint64 getLastOutputSilenceFlags() const {
+    return lastOutputSilenceFlags.load();
+  }
+
   //==============================================================================
   AudioProcessorEditor *createEditor() override {
     if (auto *view = tryCreatingView())
@@ -3043,6 +3052,9 @@ private:
   */
   VST3FloatAndDoubleBusMapComposite inputBusMap, outputBusMap;
   Array<Vst::AudioBusBuffers> inputBuses, outputBuses;
+  // mstand: what the plug-in left in outputBuses[0].silenceFlags after its
+  // last process call; the audio thread writes it, Python reads it.
+  std::atomic<Steinberg::uint64> lastOutputSilenceFlags{0};
   AudioProcessor::BusesLayout cachedBusLayouts;
 
   StringArray programNames;
@@ -3348,8 +3360,37 @@ private:
         outputBuses, outputBusMap.get<FloatType>(),
         cachedBusLayouts.outputBuses, buffer);
 
+    // NOTE(mstand, 2026-09-26): JUCE always sends silenceFlags = 0, so a
+    // plug-in never learns that its input is silent and processes zeros at
+    // full cost. DAWs (Studio One) set a bit for every silent input channel,
+    // and plug-ins that honour it skip the work. The bit is set only for a
+    // channel that is exactly zero, as the VST3 SDK expects (its "again"
+    // example relies on it); the output flags are the plug-in's to set.
+    auto &inputMap = inputBusMap.get<FloatType>();
+    for (int bus = 0; bus < inputBuses.size(); ++bus)
+      inputBuses.getReference(bus).silenceFlags =
+          silentChannels(inputMap.getReference(bus), buffer.getNumSamples());
+    // The output flags are the plug-in's to set; cleared here so that what it
+    // leaves after the call is from this call, not from an earlier one.
+    for (auto &bus : outputBuses)
+      bus.silenceFlags = 0;
+
     destination.inputs = inputBuses.getRawDataPointer();
     destination.outputs = outputBuses.getRawDataPointer();
+  }
+
+  /** Bit per channel whose samples are all exactly zero: VST3 silenceFlags. */
+  template <typename FloatType>
+  static Steinberg::uint64 silentChannels(const Array<FloatType *> &channels,
+                                          int numSamples) {
+    Steinberg::uint64 flags = 0;
+    for (int channel = 0; channel < jmin(channels.size(), 64); ++channel) {
+      const FloatType *samples = channels.getUnchecked(channel);
+      if (std::all_of(samples, samples + numSamples,
+                      [](FloatType x) { return x == FloatType(0); }))
+        flags |= Steinberg::uint64(1) << channel;
+    }
+    return flags;
   }
 
   void associateWith(Vst::ProcessData &destination, MidiBuffer &midiBuffer) {
@@ -3658,6 +3699,14 @@ bool PatchedVST3PluginFormat::setStateFromVSTPresetFile(
     return vst3->setStateFromPresetFile(rawData);
 
   return false;
+}
+
+uint64 PatchedVST3PluginFormat::lastOutputSilenceFlags(
+    const AudioPluginInstance *api) {
+  if (auto vst3 = dynamic_cast<const PatchedVST3PluginInstance *>(api))
+    return vst3->getLastOutputSilenceFlags();
+
+  return 0;
 }
 
 void PatchedVST3PluginFormat::findAllTypesForFile(

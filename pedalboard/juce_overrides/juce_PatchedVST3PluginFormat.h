@@ -69,6 +69,11 @@ public:
   setStateFromVSTPresetFile(AudioPluginInstance *, const MemoryBlock &);
 #endif
 
+  /** mstand: the silence flags the plug-in set on its main output bus in its
+      last process call — a bit per channel it declares all-zero. 0 for a
+      plug-in that never sets them, and for an instance of another format. */
+  static uint64 lastOutputSilenceFlags(const AudioPluginInstance *);
+
   //==============================================================================
   static String getFormatName() { return "VST3"; }
   String getName() const override { return getFormatName(); }

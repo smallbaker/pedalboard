@@ -1041,7 +1041,8 @@ inline void ensureDPIAwareness() {
 }
 
 template <typename ExternalPluginType>
-class ExternalPlugin : public AbstractExternalPlugin {
+class ExternalPlugin : public AbstractExternalPlugin,
+                       public juce::AudioProcessorListener {
 public:
   ExternalPlugin(
       std::string &_pathToPluginFile,
@@ -1163,9 +1164,75 @@ public:
     }
   }
 
+  /**
+   * mstand: start listening to the plugin's own parameter changes.
+   *
+   * A host learns what the plugin's window did to a knob only by listening:
+   * reading values back costs a text round-trip per knob, and polling 605 of
+   * them (FabFilter Pro-Q 4) is not an option. JUCE tells us instead.
+   *
+   * Called right after a fresh instance is adopted, on the main thread, while
+   * the plugin is not processing.
+   */
+  void listenToParameterChanges() {
+    if (!pluginInstance)
+      return;
+    size_t count = (size_t)pluginInstance->getParameters().size();
+    parameterCount = count;
+    lastParameterValue.reset(count ? new std::atomic<float>[count] : nullptr);
+    parameterIsDirty.reset(count ? new std::atomic<bool>[count] : nullptr);
+    for (size_t i = 0; i < count; i++) {
+      lastParameterValue[i].store(0.0f, std::memory_order_relaxed);
+      parameterIsDirty[i].store(false, std::memory_order_relaxed);
+    }
+    pluginInstance->addListener(this);
+  }
+
+  /**
+   * mstand: the plugin changed one of its parameters.
+   *
+   * May arrive on any thread, including the audio thread, so this does no
+   * allocation and takes no locks: the newest value per parameter wins, which
+   * is all a host needs — the values in between are what a knob passes
+   * through, not where it lands.
+   */
+  void audioProcessorParameterChanged(juce::AudioProcessor *, int index,
+                                      float newValue) override {
+    if (index < 0 || (size_t)index >= parameterCount)
+      return;
+    lastParameterValue[index].store(newValue, std::memory_order_relaxed);
+    parameterIsDirty[index].store(true, std::memory_order_release);
+  }
+
+  /** mstand: latency, programs and the rest — not our business here. */
+  void audioProcessorChanged(juce::AudioProcessor *,
+                             const ChangeDetails &) override {}
+
+  /**
+   * mstand: take the parameters that changed since the last call.
+   *
+   * Returns pairs of (parameter index, raw value in 0..1). Empty when nothing
+   * moved, which is the common case: the caller asks on every poll.
+   */
+  std::vector<std::pair<int, float>> takeParameterChanges() {
+    std::vector<std::pair<int, float>> changes;
+    for (size_t i = 0; i < parameterCount; i++) {
+      if (parameterIsDirty[i].exchange(false, std::memory_order_acquire)) {
+        changes.emplace_back((int)i,
+                             lastParameterValue[i].load(std::memory_order_relaxed));
+      }
+    }
+    return changes;
+  }
+
   ~ExternalPlugin() {
     {
       std::lock_guard<std::mutex> lock(EXTERNAL_PLUGIN_MUTEX);
+      if (pluginInstance) {
+        // mstand: the listener points at this object; it must go before the
+        // instance that could still call it.
+        pluginInstance->removeListener(this);
+      }
       // The editor component inside the window belongs to the plugin
       // instance: the window has to go first.
       editorWindow.reset();
@@ -1297,6 +1364,8 @@ public:
       }
 
       pluginInstance->setPlayHead(&playHead);
+      // mstand: a fresh instance has its own parameters.
+      listenToParameterChanges();
       pluginInstance->enableAllBuses();
 
       auto mainInputBus = pluginInstance->getBus(true, 0);
@@ -1325,6 +1394,8 @@ public:
                                          loadError.toStdString());
           }
           pluginInstance->setPlayHead(&playHead);
+      // mstand: a fresh instance has its own parameters.
+      listenToParameterChanges();
         }
       }
 
@@ -1654,6 +1725,14 @@ public:
    */
   void reset() override {
     if (pluginInstance) {
+      // No audio has gone through the plugin since it was last reset,
+      // prepared or (re)created, so its state is the fresh one already, and
+      // deactivating it again would only buy another wake-up (AL-1: 0.9 s).
+      // Callers need not track whether they reset already: pedalboard's own
+      // process() resets right after a caller's reset(), for one.
+      if (samplesProvided == 0) {
+        return;
+      }
       switch (reloadType) {
       case ExternalPluginReloadType::ClearsAudioOnReset:
         // Deactivate and prepare again right away with the same spec: the
@@ -1929,6 +2008,22 @@ public:
     if (!pluginInstance)
       return 0;
     return pluginInstance->getLatencySamples();
+  }
+
+  // mstand: the tail the plugin declares to the host (VST3 getTailSamples),
+  // in seconds at the current sample rate; infinity for a plugin that says it
+  // never falls silent.
+  double getTailLengthSeconds() const {
+    if (!pluginInstance)
+      return 0.0;
+    return pluginInstance->getTailLengthSeconds();
+  }
+
+  // mstand: the silence flags the plugin set on its main output in its last
+  // process call — a bit per channel it declares all-zero (VST3 only).
+  juce::uint64 getOutputSilenceFlags() const {
+    return juce::PatchedVST3PluginFormat::lastOutputSilenceFlags(
+        pluginInstance.get());
   }
 
   virtual bool acceptsAudioInput() override {
@@ -2287,6 +2382,13 @@ private:
   juce::AudioPluginFormatManager pluginFormatManager;
   std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
 
+  // mstand: the plugin's own parameter changes, newest value per parameter.
+  // Written from any thread by audioProcessorParameterChanged(), drained by
+  // takeParameterChanges() on the caller's thread.
+  size_t parameterCount = 0;
+  std::unique_ptr<std::atomic<float>[]> lastParameterValue;
+  std::unique_ptr<std::atomic<bool>[]> parameterIsDirty;
+
   long samplesProvided = 0;
   float initializationTimeout = DEFAULT_INITIALIZATION_TIMEOUT_SECONDS;
 };
@@ -2544,6 +2646,19 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
              ss << ">";
              return ss.str();
            })
+      .def("_take_parameter_changes",
+           &ExternalPlugin<juce::PatchedVST3PluginFormat>::takeParameterChanges,
+          R"(
+Return the parameters the plugin changed by itself since the last call.
+
+A list of ``(index, raw_value)`` pairs, where ``raw_value`` is in 0..1 and
+``index`` matches ``AudioProcessorParameter.index``. Turning a knob in the
+plugin's own editor window is the usual source; setting a parameter from
+Python is not, as that does not notify listeners.
+
+Only the newest value of each parameter is kept, so a drag reports where
+the knob landed, not every value it passed through.
+)")
       .def("load_preset",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::loadPresetFile,
            "Load a VST3 preset file in .vstpreset format.",
@@ -2672,6 +2787,25 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
           "informational purposes. Note that not all plugins correctly report "
           "the latency that they introduce, so this value may be inaccurate "
           "(especially if the plugin reports 0).\n\n*Introduced in v0.9.12.*")
+      .def_property_readonly(
+          "tail_length_seconds",
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.getTailLengthSeconds();
+          },
+          "How long the plugin says it keeps sounding after its input falls "
+          "silent, in seconds: 0 for no tail, ``inf`` for a plugin that never "
+          "falls silent (VST3 ``getTailSamples``). A host may stop calling a "
+          "plugin whose input has been silent for longer than this. Depends on "
+          "the sample rate, so read it after ``prepare_to_play``.")
+      .def_property_readonly(
+          "output_silence_flags",
+          [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
+            return plugin.getOutputSilenceFlags();
+          },
+          "The silence flags the plugin set on its main output in its last "
+          "process call: bit N set means the plugin declares output channel N "
+          "all-zero (VST3 ``AudioBusBuffers::silenceFlags``). 0 for a plugin "
+          "that never sets them.")
       .def_property_readonly(
           "_parameters",
           &ExternalPlugin<juce::PatchedVST3PluginFormat>::getParameters,
@@ -2901,6 +3035,19 @@ see :class:`pedalboard.VST3Plugin`.)
           py::arg("plugin_name") = py::none(),
           py::arg("initialization_timeout") =
               DEFAULT_INITIALIZATION_TIMEOUT_SECONDS)
+      .def("_take_parameter_changes",
+           &ExternalPlugin<juce::AudioUnitPluginFormat>::takeParameterChanges,
+          R"(
+Return the parameters the plugin changed by itself since the last call.
+
+A list of ``(index, raw_value)`` pairs, where ``raw_value`` is in 0..1 and
+``index`` matches ``AudioProcessorParameter.index``. Turning a knob in the
+plugin's own editor window is the usual source; setting a parameter from
+Python is not, as that does not notify listeners.
+
+Only the newest value of each parameter is kept, so a drag reports where
+the knob landed, not every value it passed through.
+)")
       .def("__repr__",
            [](const ExternalPlugin<juce::AudioUnitPluginFormat> &plugin) {
              std::ostringstream ss;
