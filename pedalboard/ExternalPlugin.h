@@ -18,7 +18,9 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -58,6 +60,17 @@ static std::mutex EXTERNAL_PLUGIN_MUTEX;
 static int NUM_ACTIVE_EXTERNAL_PLUGINS = 0;
 
 static const float DEFAULT_INITIALIZATION_TIMEOUT_SECONDS = 10.0f;
+
+/**
+ * mstand: how many times a plugin in this process changed its latency.
+ *
+ * A plugin reports a new latency itself (VST3: restartComponent with
+ * kLatencyChanged); JUCE stores the number and tells the listeners, and every
+ * ExternalPlugin listens (audioProcessorChanged). A host that keeps its
+ * chain's latency asks this one counter per block instead of every plugin:
+ * while the count stands still, no plugin's latency has moved.
+ */
+inline std::atomic<std::uint64_t> latencyChanges{0};
 
 static const std::string AUDIO_UNIT_NOT_INSTALLED_ERROR =
     "macOS requires plugin files to be moved to "
@@ -1216,9 +1229,18 @@ public:
     parameterIsDirty[index].store(true, std::memory_order_release);
   }
 
-  /** mstand: latency, programs and the rest — not our business here. */
+  /**
+   * mstand: count the plugin's latency changes (see latencyChanges).
+   *
+   * JUCE calls this right after it has stored the new latency, so a reader
+   * that sees the new count also sees the new number. Programs and the rest
+   * are not our business here.
+   */
   void audioProcessorChanged(juce::AudioProcessor *,
-                             const ChangeDetails &) override {}
+                             const ChangeDetails &details) override {
+    if (details.latencyChanged)
+      latencyChanges.fetch_add(1, std::memory_order_release);
+  }
 
   /**
    * mstand: take the parameters that changed since the last call.
@@ -2406,6 +2428,17 @@ private:
 };
 
 inline void init_external_plugins(py::module &m) {
+  m.def(
+      "_latency_changes",
+      []() { return latencyChanges.load(std::memory_order_acquire); },
+      R"(
+How many times a plugin in this process changed its latency.
+
+A plugin reports a new latency itself; every loaded plugin listens and counts
+it here. While the number stands still, no plugin's latency has moved, so a
+host need not ask every plugin for its latency on every block.
+)");
+
   py::enum_<ExternalPluginReloadType>(
       m, "ExternalPluginReloadType",
       "Indicates the behavior of an external plugin when reset() is called.")
