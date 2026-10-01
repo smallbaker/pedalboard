@@ -90,8 +90,27 @@ PYBIND11_MODULE(pedalboard_native, m, py::mod_gil_not_used()) {
       "process",
       [](const py::array inputArray, double sampleRate,
          const std::vector<std::shared_ptr<Plugin>> plugins,
-         unsigned int bufferSize, bool reset) {
-        return process(inputArray, sampleRate, plugins, bufferSize, reset);
+         unsigned int bufferSize, bool reset, py::object seconds) {
+        if (seconds.is_none())
+          return process(inputArray, sampleRate, plugins, bufferSize, reset);
+
+        // Written to while the GIL is released, so it has to be exactly this
+        // memory: no conversion, no copy, no strides.
+        if (!py::array_t<double, py::array::c_style>::check_(seconds))
+          throw py::type_error(
+              "seconds must be a contiguous numpy array of float64.");
+        auto secondsArray =
+            py::reinterpret_borrow<py::array_t<double>>(seconds);
+        if (secondsArray.ndim() != 1 ||
+            (size_t)secondsArray.size() != plugins.size())
+          throw py::value_error(
+              "seconds must be one-dimensional, with one element per plugin "
+              "(" +
+              std::to_string(plugins.size()) + ").");
+        double *secondsData = secondsArray.mutable_data();
+        std::fill(secondsData, secondsData + plugins.size(), 0.0);
+        return process(inputArray, sampleRate, plugins, bufferSize, reset,
+                       secondsData);
       },
       R"(
 Run a 32-bit or 64-bit floating point audio buffer through a
@@ -107,10 +126,17 @@ processing begins, clearing any state from previous calls to ``process``.
 If calling ``process`` multiple times while processing the same audio file
 or buffer, set ``reset`` to ``False``.
 
+If ``seconds`` is given - a writeable, contiguous, one-dimensional ``float64``
+array with one element per plugin - the time each plugin spent processing this
+buffer is written into it, in seconds, in the order of ``plugins``; a plugin
+the audio did not reach gets zero. A host that runs its whole chain in one call
+still sees what every plugin costs.
+
 :meta private:
 )",
       py::arg("input_array"), py::arg("sample_rate"), py::arg("plugins"),
-      py::arg("buffer_size") = DEFAULT_BUFFER_SIZE, py::arg("reset") = true);
+      py::arg("buffer_size") = DEFAULT_BUFFER_SIZE, py::arg("reset") = true,
+      py::arg("seconds") = py::none());
 
   plugin
       .def(py::init([]() {

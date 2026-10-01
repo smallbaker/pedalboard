@@ -18,6 +18,8 @@
 #pragma once
 #include "JuceHeader.h"
 
+#include <chrono>
+
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
@@ -29,10 +31,20 @@ namespace py = pybind11;
 
 namespace Pedalboard {
 
+/**
+ * Run the plugins over ioBuffer one after another, in place.
+ *
+ * If `seconds` is not null, it points at one double per element of
+ * `plugins`; the time each plugin spent processing this buffer is written
+ * there, and a plugin the audio did not reach is left untouched - the caller
+ * zeroes the array first. A host that runs its whole chain in one call still
+ * sees what every plugin costs.
+ */
 inline int process(juce::AudioBuffer<float> &ioBuffer,
                    juce::dsp::ProcessSpec spec,
                    const std::vector<std::shared_ptr<Plugin>> &plugins,
-                   bool isProbablyLastProcessCall) {
+                   bool isProbablyLastProcessCall,
+                   double *seconds = nullptr) {
   int totalOutputLatencySamples = 0;
   int expectedOutputLatency = 0;
 
@@ -58,9 +70,18 @@ inline int process(juce::AudioBuffer<float> &ioBuffer,
   int startOfOutputInBuffer = 0;
   int lastSampleInBuffer = 0;
 
-  for (auto plugin : plugins) {
+  for (size_t pluginIndex = 0; pluginIndex < plugins.size(); pluginIndex++) {
+    auto plugin = plugins[pluginIndex];
     if (!plugin)
       continue;
+
+    // A plugin upstream may have held the whole buffer back to fill its
+    // latency; this one then has nothing to process and its time stays zero.
+    const bool timed =
+        seconds && startOfOutputInBuffer < intendedOutputBufferSize;
+    std::chrono::steady_clock::time_point pluginStarted;
+    if (timed)
+      pluginStarted = std::chrono::steady_clock::now();
 
     int pluginSamplesReceived = 0;
 
@@ -142,6 +163,12 @@ inline int process(juce::AudioBuffer<float> &ioBuffer,
         }
       }
     }
+
+    if (timed)
+      seconds[pluginIndex] = std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() -
+                                 pluginStarted)
+                                 .count();
   }
 
   // Trim the output buffer down to size; this operation should be
@@ -162,7 +189,7 @@ inline int process(juce::AudioBuffer<float> &ioBuffer,
 py::array_t<float>
 processFloat32(const py::array_t<float, py::array::c_style> inputArray,
                double sampleRate, std::vector<std::shared_ptr<Plugin>> plugins,
-               unsigned int bufferSize, bool reset) {
+               unsigned int bufferSize, bool reset, double *seconds = nullptr) {
 
   ChannelLayout inputChannelLayout;
   if (!plugins.empty()) {
@@ -266,7 +293,7 @@ processFloat32(const py::array_t<float, py::array::c_style> inputArray,
     }
 
     // Actually run the process method of all plugins.
-    int samplesReturned = process(ioBuffer, spec, plugins, reset);
+    int samplesReturned = process(ioBuffer, spec, plugins, reset, seconds);
     totalOutputLatencySamples = ioBuffer.getNumSamples() - samplesReturned;
   }
 
@@ -277,7 +304,8 @@ processFloat32(const py::array_t<float, py::array::c_style> inputArray,
 
 py::array_t<float> process(py::array inputArray, double sampleRate,
                            const std::vector<std::shared_ptr<Plugin>> plugins,
-                           unsigned int bufferSize, bool reset) {
+                           unsigned int bufferSize, bool reset,
+                           double *seconds = nullptr) {
   py::array_t<float, py::array::c_style> float32InputArray;
   switch (inputArray.dtype().char_()) {
   case 'f':
@@ -292,7 +320,7 @@ py::array_t<float> process(py::array inputArray, double sampleRate,
   }
 
   return processFloat32(float32InputArray, sampleRate, plugins, bufferSize,
-                        reset);
+                        reset, seconds);
 }
 
 } // namespace Pedalboard
