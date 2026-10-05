@@ -34,6 +34,7 @@
 
 #include "AudioUnitParser.h"
 #include "Plugin.h"
+#include <pybind11/functional.h>
 #include <pybind11/stl.h>
 
 #include "juce_overrides/juce_PatchedVST3PluginFormat.h"
@@ -195,6 +196,18 @@ An example of how to programmatically close an editor window::
 
    # This will block until the other thread calls .set():
    plugin.show_editor(close_window_event)
+)";
+
+static constexpr const char *TAKE_PARAMETER_CHANGES_DOCSTRING = R"(
+Return the parameters the plugin changed by itself since the last call.
+
+A list of ``(index, raw_value)`` pairs, where ``raw_value`` is in 0..1 and
+``index`` matches ``AudioProcessorParameter.index``. Turning a knob in the
+plugin's own editor window is the usual source; setting a parameter from
+Python is not, as that does not notify listeners.
+
+Only the newest value of each parameter is kept, so a drag reports where
+the knob landed, not every value it passed through.
 )";
 
 inline std::vector<std::string> findInstalledVSTPluginPaths() {
@@ -578,7 +591,6 @@ public:
   explicit PluginPowerButton(PluginWindowLookAndFeel &look)
       : PluginTitleButton("power", look) {
     setClickingTogglesState(true);
-    setTooltip("Bypass");
   }
 
   void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
@@ -609,7 +621,6 @@ public:
   explicit PluginPinButton(PluginWindowLookAndFeel &look)
       : PluginTitleButton("pin", look) {
     setClickingTogglesState(true);
-    setTooltip("Pin: keep this window when another plugin opens");
   }
 
   void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
@@ -647,9 +658,7 @@ public:
 class PluginCloseButton : public PluginTitleButton {
 public:
   explicit PluginCloseButton(PluginWindowLookAndFeel &look)
-      : PluginTitleButton("close", look) {
-    setTooltip("Close");
-  }
+      : PluginTitleButton("close", look) {}
 
   void paintButton(juce::Graphics &g, bool highlighted, bool down) override {
     const bool hot = highlighted || down;
@@ -674,7 +683,7 @@ public:
                          std::optional<std::pair<int, int>> position = {},
                          std::optional<std::tuple<int, int, int, int>> centreOn = {},
                          void *owner = nullptr)
-      : DocumentWindow(title, colours.bar, 0, false), processor(processor),
+      : DocumentWindow(title, colours.bar, 0, false),
         onPower(std::move(onPower)), onPin(std::move(onPin)),
         resizeBorder(resizeBorder), owner(owner) {
     // Our own frame, drawn by JUCE, instead of the native one: the stand
@@ -685,13 +694,11 @@ public:
     // Without on_pin nobody would act on the pin, so there is no pin then.
     lookAndFeel.rightButtons = this->onPin ? 2 : 1;
     setLookAndFeel(&lookAndFeel);
-    setUsingNativeTitleBar(false);
     // JUCE paints the shadow of a non-native window with four extra
     // top-level windows around it; a host that watches the windows of this
     // process (or a screen reader) would see five windows instead of one.
     setDropShadowEnabled(false);
     setTitleBarHeight(PluginWindowLookAndFeel::TITLE_BAR_HEIGHT);
-    setTitleBarTextCentred(false);
 
     powerButton.setToggleState(powered, juce::dontSendNotification);
     powerButton.onClick = [this] {
@@ -699,18 +706,21 @@ public:
         this->onPower(powerButton.getToggleState());
       }
     };
-    addAndMakeVisible(powerButton);
+    // Component:: on purpose, here and below: a debug build of JUCE hides
+    // these two in ResizableWindow to point people at setContentOwned(),
+    // and the unqualified calls do not compile there.
+    Component::addAndMakeVisible(powerButton);
 
     pinButton.onClick = [this] {
       if (this->onPin) {
         this->onPin(pinButton.getToggleState());
       }
     };
-    addChildComponent(pinButton);
+    Component::addChildComponent(pinButton);
     pinButton.setVisible((bool)this->onPin);
 
     closeButton.onClick = [this] { closeButtonPressed(); };
-    addAndMakeVisible(closeButton);
+    Component::addAndMakeVisible(closeButton);
 
     // The border the host asks for lies around every editor, and the window
     // of a plugin that resizes is dragged by it. It lies around the editor and
@@ -718,7 +728,7 @@ public:
     // itself. The grip sits in front of the content so that the mouse in the
     // border reaches it and not the editor's own border component.
     grip.setAlwaysOnTop(true);
-    addChildComponent(grip);
+    Component::addChildComponent(grip);
 
     // Where the host wants the window: set before the window is created, so
     // that it is created there - before the plugin's view is attached
@@ -979,7 +989,6 @@ public:
   }
 
 private:
-  juce::AudioProcessor &processor;
   std::function<void(bool)> onPower;
   std::function<void(bool)> onPin;
   /** Width of the border around the editor, in pixels; zero — none. */
@@ -991,7 +1000,7 @@ private:
   PluginPowerButton powerButton{lookAndFeel};
   PluginPinButton pinButton{lookAndFeel};
   PluginCloseButton closeButton{lookAndFeel};
-  juce::ResizableBorderComponent grip{this, getConstrainer()};
+  juce::ResizableBorderComponent grip{this, nullptr};
 
   JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(StandalonePluginWindow)
 };
@@ -2063,21 +2072,22 @@ public:
   }
 
   /**
-   * A plain function for the editor window that calls the Python callable
-   * kept in `holder`. The callable lives in a member so that it is copied and
-   * released while we hold the GIL; the function acquires the GIL when a
-   * button is clicked, and prints an exception instead of letting it unwind
-   * through JUCE's event loop.
+   * The Python callable of a window button, wrapped so that an exception it
+   * raises is printed instead of unwinding through JUCE's event loop. The
+   * std::function that pybind11 makes of the callable takes the GIL itself
+   * to call, copy and release it, so the window may keep it and drop it
+   * with the GIL released. No callable (None) gives an empty function.
    */
-  std::function<void(bool)> windowCallback(py::object &holder) {
-    if (holder.is_none()) {
+  static std::function<void(bool)>
+  printingErrors(std::function<void(bool)> callback) {
+    if (!callback) {
       return {};
     }
-    return [&holder](bool state) {
-      py::gil_scoped_acquire acquire;
+    return [callback = std::move(callback)](bool state) {
       try {
-        holder(state);
+        callback(state);
       } catch (py::error_already_set &e) {
+        py::gil_scoped_acquire acquire;
         e.restore();
         PyErr_Print();
       }
@@ -2085,15 +2095,11 @@ public:
   }
 
   void showEditor(py::object optionalEvent, std::optional<std::string> title,
-                  bool powered, py::object onPower) {
+                  bool powered, std::function<void(bool)> onPower) {
     if (!pluginInstance) {
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
           "Pedalboard error and should be reported.");
-    }
-
-    if (onPower != py::none() && !py::hasattr(onPower, "__call__")) {
-      throw py::type_error("on_power must be callable or None.");
     }
 
     if (optionalEvent != py::none() && !py::hasattr(optionalEvent, "is_set")) {
@@ -2117,20 +2123,12 @@ public:
       }
     }
 
-    editorPowerCallback = onPower;
-    const auto callback = windowCallback(editorPowerCallback);
-
     const juce::String windowTitle =
         title ? juce::String(*title)
               : juce::String(pluginInstance->getName());
-    try {
-      StandalonePluginWindow::openWindowAndWait(
-          *pluginInstance, optionalEvent, windowTitle, powered, callback);
-    } catch (...) {
-      editorPowerCallback = py::none();
-      throw;
-    }
-    editorPowerCallback = py::none();
+    StandalonePluginWindow::openWindowAndWait(
+        *pluginInstance, optionalEvent, windowTitle, powered,
+        printingErrors(std::move(onPower)));
   }
 
   /**
@@ -2139,7 +2137,8 @@ public:
    * (message) thread, or the window will not repaint or react.
    */
   void openEditor(std::optional<std::string> title, bool powered,
-                  py::object onPower, py::object onPin, py::object colors,
+                  std::function<void(bool)> onPower,
+                  std::function<void(bool)> onPin, py::object colors,
                   int resizeBorder,
                   std::optional<std::pair<int, int>> position,
                   std::optional<std::tuple<int, int, int, int>> centreOn,
@@ -2148,12 +2147,6 @@ public:
       throw std::runtime_error(
           "Editor cannot be shown - plugin not loaded. This is an internal "
           "Pedalboard error and should be reported.");
-    }
-    if (onPower != py::none() && !py::hasattr(onPower, "__call__")) {
-      throw py::type_error("on_power must be callable or None.");
-    }
-    if (onPin != py::none() && !py::hasattr(onPin, "__call__")) {
-      throw py::type_error("on_pin must be callable or None.");
     }
     if (resizeBorder < 0) {
       throw py::value_error("resize_border must be 0 or more.");
@@ -2170,10 +2163,8 @@ public:
       editorWindow.reset();
     }
 
-    editorPowerCallback = onPower;
-    editorPinCallback = onPin;
-    auto powerCallback = windowCallback(editorPowerCallback);
-    auto pinCallback = windowCallback(editorPinCallback);
+    auto powerCallback = printingErrors(std::move(onPower));
+    auto pinCallback = printingErrors(std::move(onPin));
     const juce::String windowTitle =
         title ? juce::String(*title)
               : juce::String(pluginInstance->getName());
@@ -2190,16 +2181,12 @@ public:
   /** Close the editor window opened by openEditor(), if any. */
   void closeEditor() {
     checkEditorThread();
-    {
-      py::gil_scoped_release release;
-      if (editorWindow) {
-        editorWindow->setVisible(false);
-        editorWindow.reset();
-        juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
-      }
+    py::gil_scoped_release release;
+    if (editorWindow) {
+      editorWindow->setVisible(false);
+      editorWindow.reset();
+      juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
     }
-    editorPowerCallback = py::none();
-    editorPinCallback = py::none();
   }
 
   /**
@@ -2375,8 +2362,6 @@ public:
 
   PlayHead playHead;
 
-  py::object editorPowerCallback = py::none();
-  py::object editorPinCallback = py::none();
   std::unique_ptr<StandalonePluginWindow> editorWindow;
 
 private:
@@ -2694,17 +2679,7 @@ example: a Windows VST3 plugin bundle will not load on Linux or macOS.)
            })
       .def("_take_parameter_changes",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::takeParameterChanges,
-          R"(
-Return the parameters the plugin changed by itself since the last call.
-
-A list of ``(index, raw_value)`` pairs, where ``raw_value`` is in 0..1 and
-``index`` matches ``AudioProcessorParameter.index``. Turning a knob in the
-plugin's own editor window is the usual source; setting a parameter from
-Python is not, as that does not notify listeners.
-
-Only the newest value of each parameter is kept, so a drag reports where
-the knob landed, not every value it passed through.
-)")
+           TAKE_PARAMETER_CHANGES_DOCSTRING)
       .def("load_preset",
            &ExternalPlugin<juce::PatchedVST3PluginFormat>::loadPresetFile,
            "Load a VST3 preset file in .vstpreset format.",
@@ -2842,7 +2817,7 @@ the knob landed, not every value it passed through.
           "silent, in seconds: 0 for no tail, ``inf`` for a plugin that never "
           "falls silent (VST3 ``getTailSamples``). A host may stop calling a "
           "plugin whose input has been silent for longer than this. Depends on "
-          "the sample rate, so read it after ``prepare_to_play``.")
+          "the sample rate, so read it after ``prepare``.")
       .def_property_readonly(
           "output_silence_flags",
           [](ExternalPlugin<juce::PatchedVST3PluginFormat> &plugin) {
@@ -3083,17 +3058,7 @@ see :class:`pedalboard.VST3Plugin`.)
               DEFAULT_INITIALIZATION_TIMEOUT_SECONDS)
       .def("_take_parameter_changes",
            &ExternalPlugin<juce::AudioUnitPluginFormat>::takeParameterChanges,
-          R"(
-Return the parameters the plugin changed by itself since the last call.
-
-A list of ``(index, raw_value)`` pairs, where ``raw_value`` is in 0..1 and
-``index`` matches ``AudioProcessorParameter.index``. Turning a knob in the
-plugin's own editor window is the usual source; setting a parameter from
-Python is not, as that does not notify listeners.
-
-Only the newest value of each parameter is kept, so a drag reports where
-the knob landed, not every value it passed through.
-)")
+           TAKE_PARAMETER_CHANGES_DOCSTRING)
       .def("__repr__",
            [](const ExternalPlugin<juce::AudioUnitPluginFormat> &plugin) {
              std::ostringstream ss;
