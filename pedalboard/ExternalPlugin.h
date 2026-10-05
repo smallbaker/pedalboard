@@ -1915,10 +1915,11 @@ public:
 
       // To compensate for any latency added by the plugin,
       // only tell Pedalboard to use the last _n_ samples.
-      long usableSamplesProduced =
-          std::max(0L, samplesProvided - pluginInstance->getLatencySamples());
-      return static_cast<int>(
-          std::min(usableSamplesProduced, (long)outputBlock.getNumSamples()));
+      juce::int64 usableSamplesProduced = std::max(
+          (juce::int64)0,
+          samplesProvided - (juce::int64)pluginInstance->getLatencySamples());
+      return static_cast<int>(std::min(
+          usableSamplesProduced, (juce::int64)outputBlock.getNumSamples()));
     }
 
     return 0;
@@ -2423,7 +2424,10 @@ private:
   std::unique_ptr<std::atomic<float>[]> lastParameterValue;
   std::unique_ptr<std::atomic<bool>[]> parameterIsDirty;
 
-  long samplesProvided = 0;
+  // 64 bits on every platform: `long` is 32 bits on Windows, and a plugin
+  // that is never reset stopped returning audio after 2^31 samples
+  // (12 h 26 min at 48 kHz).
+  juce::int64 samplesProvided = 0;
   float initializationTimeout = DEFAULT_INITIALIZATION_TIMEOUT_SECONDS;
 };
 
