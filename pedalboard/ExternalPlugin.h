@@ -57,7 +57,6 @@ namespace Pedalboard {
 // JUCE external plugins use some global state; here we lock that state
 // to play nicely with the Python interpreter.
 static std::mutex EXTERNAL_PLUGIN_MUTEX;
-static int NUM_ACTIVE_EXTERNAL_PLUGINS = 0;
 
 static const float DEFAULT_INITIALIZATION_TIMEOUT_SECONDS = 10.0f;
 
@@ -1274,12 +1273,13 @@ public:
         pluginInstance->setPlayHead(nullptr);
       }
       pluginInstance.reset();
-      NUM_ACTIVE_EXTERNAL_PLUGINS--;
-
-      if (NUM_ACTIVE_EXTERNAL_PLUGINS == 0) {
-        juce::DeletedAtShutdown::deleteAll();
-        juce::MessageManager::deleteInstance();
-      }
+      // mstand: JUCE stays up for the life of the process, as in any host.
+      // Upstream shut it down here once the last plugin was gone
+      // (DeletedAtShutdown::deleteAll, MessageManager::deleteInstance), and
+      // the plugin libraries were unloaded with it - on whatever thread
+      // released that plugin. Off the main thread a plugin's hidden window
+      // outlived its unloaded code, and the next message to it crashed the
+      // process (stand KNOWN_ISSUES 235).
     }
   }
 
@@ -1379,7 +1379,6 @@ public:
         editorWindow.reset();
         pluginInstance->setPlayHead(nullptr);
         pluginInstance.reset();
-        NUM_ACTIVE_EXTERNAL_PLUGINS--;
       }
     }
 
@@ -1432,8 +1431,6 @@ public:
       listenToParameterChanges();
         }
       }
-
-      NUM_ACTIVE_EXTERNAL_PLUGINS++;
     }
 
     pluginInstance->setStateInformation(savedState.getData(),
