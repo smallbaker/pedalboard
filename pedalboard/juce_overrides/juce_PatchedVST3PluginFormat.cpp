@@ -2242,7 +2242,7 @@ public:
 
     editController->setComponentHandler(nullptr);
 
-    if (isControllerInitialised)
+    if (isControllerInitialised && !controllerIsComponent)
       editController->terminate();
 
     holder->terminate();
@@ -2273,9 +2273,18 @@ public:
     if (!(isControllerInitialised || holder->fetchController(editController)))
       return false;
 
-    // (May return an error if the plugin combines the IComponent and
-    // IEditController implementations)
-    editController->initialize(holder->host->getFUnknown());
+    // mstand: a plug-in without a separate controller class is one object,
+    // both its IComponent and its IEditController (fetchController() falls
+    // back to the component itself). holder->initialise() has initialised
+    // that object already; a second initialize() is refused (kResultFalse),
+    // and Softube plug-ins then mute their output for good (KNOWN_ISSUES
+    // 352). So only a separate controller is initialised here, and cleanup()
+    // leaves the one terminate() to the component.
+    controllerIsComponent = isSameObject(holder->component.get(),
+                                         editController.get());
+
+    if (!controllerIsComponent)
+      editController->initialize(holder->host->getFUnknown());
 
     isControllerInitialised = true;
     editController->setComponentHandler(holder->host);
@@ -3111,6 +3120,26 @@ private:
   Vst::ProcessContext timingInfo; //< Only use this in processBlock()!
   bool isControllerInitialised = false, isActive = false,
        lastProcessBlockCallWasBypass = false;
+  // mstand: the controller is the component itself (see initialise()).
+  bool controllerIsComponent = false;
+
+  /** mstand: whether two interface pointers belong to one COM object - by
+   * the identity rule both answer the same FUnknown. */
+  static bool isSameObject(FUnknown *a, FUnknown *b) {
+    if (a == nullptr || b == nullptr)
+      return false;
+
+    FUnknown *identityA = nullptr, *identityB = nullptr;
+    a->queryInterface(FUnknown::iid, (void **)&identityA);
+    b->queryInterface(FUnknown::iid, (void **)&identityB);
+    const bool same = identityA != nullptr && identityA == identityB;
+
+    if (identityA != nullptr)
+      identityA->release();
+    if (identityB != nullptr)
+      identityB->release();
+    return same;
+  }
   VST3Parameter *bypassParam = nullptr;
 
   //==============================================================================
